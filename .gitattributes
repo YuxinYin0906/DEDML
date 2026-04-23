@@ -1,0 +1,2 @@
+# Track large R serialized data via Git LFS
+*.rds filter=lfs diff=lfs merge=lfs -text
