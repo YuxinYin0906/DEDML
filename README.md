@@ -1,36 +1,50 @@
 # DEDML
 
-`DEDML` provides a donor-blocked double machine learning pipeline for
-single-cell differential expression.
+`DEDML` is an R package for donor-blocked double machine learning on single-cell data.
 
-## Why this package
+It refactors the real-data script workflow into reusable functions so users can run analyses directly and choose confounders based on their own dataset.
 
-This package refactors the real-data script workflow into reusable functions so users can:
+## Install
 
-- choose treatment confounders based on their own dataset
-- choose outcome confounders based on their own dataset
-- switch nuisance learners without rewriting scripts
-- run the full pipeline directly from package functions
+From source tarball:
 
-## Core API
+```r
+install.packages("DEDML_0.1.0.tar.gz", repos = NULL, type = "source")
+```
 
-- `dedml_fit()` for matrix + metadata input
-- `dedml_fit_seurat()` for Seurat input
+## Main workflow
 
-Default learners:
+1. Build a confounder spec (donor-level + cell-level).
+2. Run `dedml_fit()` (or `dedml_fit_seurat()`).
+3. Read `fit$results`.
 
-- treatment model: `glm`
-- outcome model: `lightgbm`
+## Main function inputs (`dedml_fit`)
 
-Supported learners currently:
+- `counts`: gene-by-cell count matrix (rows = genes, cols = cells)
+- `meta`: metadata data.frame for cells
+- `donor_id_col`: donor ID column in `meta`
+- `sample_id_col`: sample ID column in `meta`
+- `treatment_col`: binary treatment column (0/1) in `meta`
+- `cell_type_col`: cell type column in `meta`
+- `confounder_spec`: object from `dedml_make_confounder_spec()`
+- `n_cores`: number of CPU cores used for gene-level parallelization
+- `treatment_learner`: default `"glm"`
+- `outcome_learner`: default `"lightgbm"`
 
-- treatment: `glm`, `lightgbm`
-- outcome: `lightgbm`, `glm`
+## Confounder helper functions
 
-## Minimal example
+- `dedml_make_confounder_spec()` creates a validated confounder specification object
+- `dedml_validate_confounder_spec()` checks that required confounder columns exist in `meta`
+
+## Example
 
 ```r
 library(DEDML)
+
+conf_spec <- dedml_make_confounder_spec(
+  donor_confounders = c("Age", "Sex"),
+  cell_confounders = c("log_nCount_RNA", "nFeature_RNA", "percent.mt")
+)
 
 fit <- dedml_fit(
   counts = counts_mat,
@@ -39,11 +53,9 @@ fit <- dedml_fit(
   sample_id_col = "sample_id",
   treatment_col = "D",
   cell_type_col = "CellType",
-  treatment_confounders = c("Age", "Sex"),
-  treatment_cell_summaries = c("log_nCount_RNA", "nFeature_RNA", "percent.mt"),
-  outcome_confounders = c("Age", "Sex", "log_nCount_RNA", "nFeature_RNA", "percent.mt"),
+  confounder_spec = conf_spec,
   n_folds = 3,
-  n_cores = 4,
+  n_cores = 8,
   treatment_learner = "glm",
   outcome_learner = "lightgbm"
 )
@@ -51,8 +63,9 @@ fit <- dedml_fit(
 head(fit$results)
 ```
 
-## Notes
+## Defaults
 
-- For `lightgbm` learners, install the `lightgbm` R package first.
-- Legacy script used for refactoring is kept at:
-  `inst/scripts/legacy_20260415_run_dedml_pb.R`.
+- treatment nuisance learner: `glm`
+- outcome nuisance learner: `lightgbm`
+- supported treatment learners: `glm`, `lightgbm`
+- supported outcome learners: `lightgbm`, `glm`

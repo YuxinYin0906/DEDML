@@ -5,6 +5,81 @@ available_dedml_learners <- function() {
   )
 }
 
+#' Build a Confounder Specification for DEDML
+#'
+#' Helper to define donor-level and cell-level confounders once, then pass
+#' them into [dedml_fit()] through `confounder_spec`.
+#'
+#' @param donor_confounders Character vector of donor-level confounders.
+#' @param cell_confounders Character vector of cell-level confounders.
+#' @param treatment_cell_summaries Optional cell-level confounders summarized by donor
+#' for treatment nuisance modeling. Defaults to `cell_confounders`.
+#'
+#' @return A named list with `treatment_confounders`, `treatment_cell_summaries`,
+#' and `outcome_confounders`.
+#' @export
+#'
+dedml_make_confounder_spec <- function(
+    donor_confounders,
+    cell_confounders,
+    treatment_cell_summaries = cell_confounders) {
+  donor_confounders <- unique(as.character(donor_confounders))
+  cell_confounders <- unique(as.character(cell_confounders))
+  treatment_cell_summaries <- unique(as.character(treatment_cell_summaries))
+
+  donor_confounders <- donor_confounders[nzchar(donor_confounders)]
+  cell_confounders <- cell_confounders[nzchar(cell_confounders)]
+  treatment_cell_summaries <- treatment_cell_summaries[nzchar(treatment_cell_summaries)]
+
+  if (length(donor_confounders) == 0L) {
+    stop("donor_confounders must contain at least one column name.", call. = FALSE)
+  }
+
+  list(
+    treatment_confounders = donor_confounders,
+    treatment_cell_summaries = treatment_cell_summaries,
+    outcome_confounders = unique(c(donor_confounders, cell_confounders))
+  )
+}
+
+#' Validate a DEDML Confounder Specification Against Metadata
+#'
+#' @param meta Metadata data.frame.
+#' @param confounder_spec List returned by [dedml_make_confounder_spec()].
+#'
+#' @return Invisibly returns `TRUE`; throws an error if invalid.
+#' @export
+#'
+dedml_validate_confounder_spec <- function(meta, confounder_spec) {
+  required_names <- c("treatment_confounders", "treatment_cell_summaries", "outcome_confounders")
+  if (!is.list(confounder_spec) || !all(required_names %in% names(confounder_spec))) {
+    stop(
+      "confounder_spec must be a list with: ",
+      paste(required_names, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  all_vars <- unique(c(
+    confounder_spec$treatment_confounders,
+    confounder_spec$treatment_cell_summaries,
+    confounder_spec$outcome_confounders
+  ))
+  all_vars <- as.character(all_vars)
+  all_vars <- all_vars[nzchar(all_vars)]
+
+  missing_vars <- setdiff(all_vars, colnames(meta))
+  if (length(missing_vars) > 0L) {
+    stop(
+      "Missing confounder columns in meta: ",
+      paste(missing_vars, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
 make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed = 123L) {
   stopifnot(length(donor_id) == length(treatment))
   donor_id <- as.character(donor_id)
@@ -274,6 +349,8 @@ fit_residual_regression_pseudobulk <- function(
 #' @param sample_id_col Sample identifier column in `meta`.
 #' @param treatment_col Binary treatment indicator column in `meta` (0/1).
 #' @param cell_type_col Cell type column in `meta`.
+#' @param confounder_spec Optional list from [dedml_make_confounder_spec()]. If provided,
+#' this overrides `treatment_confounders`, `treatment_cell_summaries`, and `outcome_confounders`.
 #' @param treatment_confounders Donor-level confounders for treatment model.
 #' @param treatment_cell_summaries Cell-level covariates to summarize by donor for treatment model.
 #' @param outcome_confounders Cell-level confounders for outcome model.
@@ -300,6 +377,7 @@ dedml_fit <- function(
     sample_id_col = "sample_id",
     treatment_col = "D",
     cell_type_col = "CellType",
+    confounder_spec = NULL,
     treatment_confounders = c("Age", "Sex"),
     treatment_cell_summaries = c("log_nCount_RNA", "nFeature_RNA", "percent.mt"),
     outcome_confounders = c("Age", "Sex", "log_nCount_RNA", "nFeature_RNA", "percent.mt"),
@@ -350,6 +428,19 @@ dedml_fit <- function(
   if (!all(meta$.D %in% c(0L, 1L))) {
     stop("Treatment column must be coded as 0/1.", call. = FALSE)
   }
+
+  if (!is.null(confounder_spec)) {
+    dedml_validate_confounder_spec(meta = meta, confounder_spec = confounder_spec)
+    treatment_confounders <- confounder_spec$treatment_confounders
+    treatment_cell_summaries <- confounder_spec$treatment_cell_summaries
+    outcome_confounders <- confounder_spec$outcome_confounders
+  }
+
+  n_cores <- as.integer(n_cores)
+  if (is.na(n_cores) || n_cores < 1L) {
+    stop("n_cores must be a positive integer.", call. = FALSE)
+  }
+  n_cores <- min(n_cores, parallel::detectCores(logical = TRUE))
 
   if (!is.null(focus_celltypes)) {
     keep_cells <- meta$.CellType %in% focus_celltypes

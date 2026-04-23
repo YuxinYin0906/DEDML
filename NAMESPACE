@@ -1,6 +1,8 @@
 export(available_dedml_learners)
 export(dedml_fit)
 export(dedml_fit_seurat)
+export(dedml_make_confounder_spec)
+export(dedml_validate_confounder_spec)
 export(fit_residual_regression_pseudobulk)
 export(make_stratified_donor_folds)
 importFrom(data.table,rbindlist)
