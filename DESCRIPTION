@@ -1,0 +1,29 @@
+Package: DEDML
+Type: Package
+Title: Donor-Blocked Double Machine Learning for Single-Cell Differential Expression
+Version: 0.1.0
+Authors@R: c(
+    person(given = "Yuxin", family = "Yin", role = c("aut", "cre"),
+           email = "yyin0906@gmail.com")
+    )
+Description: Implements a donor-blocked double machine learning pipeline for
+    single-cell differential expression with pseudobulk residual regression.
+    Users can choose dataset-specific treatment and outcome confounders,
+    select treatment and outcome learners, and run the full workflow through
+    package functions instead of ad-hoc scripts.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Depends: R (>= 4.1)
+Imports:
+    data.table,
+    dplyr,
+    parallel,
+    sandwich,
+    stats,
+    utils
+Suggests:
+    lightgbm,
+    Matrix,
+    Seurat
+RoxygenNote: 7.3.2
