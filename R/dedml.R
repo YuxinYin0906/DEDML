@@ -1,6 +1,6 @@
 available_dedml_learners <- function() {
   list(
-    treatment = c("glm", "lightgbm"),
+    donor = c("glm", "lightgbm"),
     outcome = c("lightgbm", "glm")
   )
 }
@@ -80,6 +80,78 @@ dedml_validate_confounder_spec <- function(meta, confounder_spec) {
   invisible(TRUE)
 }
 
+#' Prepare Metadata for DEDML Input
+#'
+#' Standardizes ID and phenotype fields used by [dedml_fit()] and optionally
+#' drops incomplete rows for selected confounders.
+#'
+#' @param meta Metadata data.frame.
+#' @param donor_id Donor id column name or vector.
+#' @param sample_id Sample id column name or vector. If `NULL`, donor id is used.
+#' @param treatment Treatment column name or vector (binary 0/1).
+#' @param cell_type Cell type column name or vector.
+#' @param donor_confounders Optional donor-level confounders to validate.
+#' @param cell_confounders Optional cell-level confounders to validate.
+#' @param drop_missing Logical; if `TRUE`, removes rows with missing values in
+#' required fields and selected confounders.
+#'
+#' @return Metadata data.frame with standardized columns:
+#' `.donor_id`, `.sample_id`, `.D`, `.CellType`.
+#' @export
+#'
+dedml_prepare_metadata <- function(
+    meta,
+    donor_id = "HATIMID",
+    sample_id = "sample_id",
+    treatment = "D",
+    cell_type = "CellType",
+    donor_confounders = NULL,
+    cell_confounders = NULL,
+    drop_missing = TRUE) {
+  meta <- as.data.frame(meta, stringsAsFactors = FALSE)
+
+  .resolve <- function(x, label) {
+    if (length(x) == 1L && is.character(x) && x %in% colnames(meta)) {
+      return(meta[[x]])
+    }
+    if (length(x) == nrow(meta)) {
+      return(x)
+    }
+    stop(label, " must be a metadata column name or a vector with nrow(meta) elements.", call. = FALSE)
+  }
+
+  if (is.null(sample_id)) {
+    sample_id <- donor_id
+  }
+
+  meta$.donor_id <- as.character(.resolve(donor_id, "donor_id"))
+  meta$.sample_id <- as.character(.resolve(sample_id, "sample_id"))
+  meta$.D <- as.integer(.resolve(treatment, "treatment"))
+  meta$.CellType <- as.character(.resolve(cell_type, "cell_type"))
+
+  if (!all(meta$.D %in% c(0L, 1L, NA_integer_))) {
+    stop("treatment must be binary 0/1.", call. = FALSE)
+  }
+
+  needed <- unique(c(
+    ".donor_id", ".sample_id", ".D", ".CellType",
+    donor_confounders, cell_confounders
+  ))
+  needed <- needed[nzchar(needed)]
+
+  missing_cols <- setdiff(c(donor_confounders, cell_confounders), colnames(meta))
+  if (length(missing_cols) > 0L) {
+    stop("Missing confounder columns in meta: ", paste(missing_cols, collapse = ", "), call. = FALSE)
+  }
+
+  if (isTRUE(drop_missing)) {
+    keep <- stats::complete.cases(meta[, needed, drop = FALSE])
+    meta <- meta[keep, , drop = FALSE]
+  }
+
+  meta
+}
+
 make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed = 123L) {
   stopifnot(length(donor_id) == length(treatment))
   donor_id <- as.character(donor_id)
@@ -128,6 +200,16 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   mm <- mm[, colnames(mm) != "(Intercept)", drop = FALSE]
   storage.mode(mm) <- "double"
   mm
+}
+
+.resolve_input_column <- function(meta, value_or_name, label) {
+  if (length(value_or_name) == 1L && is.character(value_or_name) && value_or_name %in% colnames(meta)) {
+    return(list(values = meta[[value_or_name]], source = value_or_name))
+  }
+  if (length(value_or_name) == nrow(meta)) {
+    return(list(values = value_or_name, source = label))
+  }
+  stop(label, " must be a metadata column name or a vector with nrow(meta) elements.", call. = FALSE)
 }
 
 .fit_predict_glm_binomial <- function(x_train, y_train, x_test) {
@@ -345,27 +427,34 @@ fit_residual_regression_pseudobulk <- function(
 #'
 #' @param counts Gene-by-cell count matrix (rows are genes, columns are cells).
 #' @param meta Cell metadata data.frame.
-#' @param donor_id_col Donor identifier column in `meta`.
-#' @param sample_id_col Sample identifier column in `meta`.
-#' @param treatment_col Binary treatment indicator column in `meta` (0/1).
-#' @param cell_type_col Cell type column in `meta`.
+#' @param donor_id Donor identifier column name (or vector).
+#' @param sample_id Sample identifier column name (or vector). If `NULL`, donor id is used.
+#' @param treatment Binary treatment indicator column name (or vector), coded 0/1.
+#' @param cell_type Cell type column name (or vector).
 #' @param confounder_spec Optional list from [dedml_make_confounder_spec()]. If provided,
 #' this overrides `treatment_confounders`, `treatment_cell_summaries`, and `outcome_confounders`.
 #' @param treatment_confounders Donor-level confounders for treatment model.
 #' @param treatment_cell_summaries Cell-level covariates to summarize by donor for treatment model.
 #' @param outcome_confounders Cell-level confounders for outcome model.
-#' @param focus_celltypes Optional vector of cell types to keep.
+#' @param cell_types Optional vector of cell types to keep.
 #' @param gene_subset Optional vector of gene names to keep.
 #' @param n_folds Number of donor folds.
 #' @param n_cores Number of cores for gene-level parallelization.
-#' @param treatment_learner Treatment learner (`"glm"` or `"lightgbm"`).
-#' @param outcome_learner Outcome learner (`"lightgbm"` or `"glm"`).
+#' @param donor_model Donor treatment model (`"glm"` or `"lightgbm"`).
+#' @param outcome_model Outcome model (`"lightgbm"` or `"glm"`).
 #' @param treatment_params Optional list of learner hyperparameters.
 #' @param outcome_params Optional list of learner hyperparameters.
 #' @param min_cells_per_sample_ct Minimum cells in each sample-celltype pseudobulk.
 #' @param min_samples_per_celltype Minimum samples required per cell type.
 #' @param seed Random seed.
 #' @param verbose Print progress.
+#' @param donor_id_col Deprecated alias for `donor_id`.
+#' @param sample_id_col Deprecated alias for `sample_id`.
+#' @param treatment_col Deprecated alias for `treatment`.
+#' @param cell_type_col Deprecated alias for `cell_type`.
+#' @param focus_celltypes Deprecated alias for `cell_types`.
+#' @param treatment_learner Deprecated alias for `donor_model`.
+#' @param outcome_learner Deprecated alias for `outcome_model`.
 #'
 #' @return A list with `results`, `donor_meta`, `settings`, and `errors`.
 #' @export
@@ -373,26 +462,33 @@ fit_residual_regression_pseudobulk <- function(
 dedml_fit <- function(
     counts,
     meta,
-    donor_id_col = "HATIMID",
-    sample_id_col = "sample_id",
-    treatment_col = "D",
-    cell_type_col = "CellType",
+    donor_id = "HATIMID",
+    sample_id = "sample_id",
+    treatment = "D",
+    cell_type = "CellType",
     confounder_spec = NULL,
     treatment_confounders = c("Age", "Sex"),
     treatment_cell_summaries = c("log_nCount_RNA", "nFeature_RNA", "percent.mt"),
     outcome_confounders = c("Age", "Sex", "log_nCount_RNA", "nFeature_RNA", "percent.mt"),
-    focus_celltypes = NULL,
+    cell_types = NULL,
     gene_subset = NULL,
     n_folds = 3L,
     n_cores = 1L,
-    treatment_learner = "glm",
-    outcome_learner = "lightgbm",
+    donor_model = "glm",
+    outcome_model = "lightgbm",
     treatment_params = list(),
     outcome_params = list(),
     min_cells_per_sample_ct = 10L,
     min_samples_per_celltype = 3L,
     seed = 123L,
-    verbose = TRUE) {
+    verbose = TRUE,
+    donor_id_col = NULL,
+    sample_id_col = NULL,
+    treatment_col = NULL,
+    cell_type_col = NULL,
+    focus_celltypes = NULL,
+    treatment_learner = NULL,
+    outcome_learner = NULL) {
 
   if (!is.matrix(counts) && !inherits(counts, "Matrix")) {
     stop("counts must be a matrix or Matrix object.", call. = FALSE)
@@ -413,17 +509,28 @@ dedml_fit <- function(
     }
   }
 
-  required_cols <- c(donor_id_col, sample_id_col, treatment_col, cell_type_col)
-  missing_required <- setdiff(required_cols, colnames(meta))
-  if (length(missing_required) > 0L) {
-    stop("Missing required columns in meta: ", paste(missing_required, collapse = ", "), call. = FALSE)
-  }
+  if (!is.null(donor_id_col)) donor_id <- donor_id_col
+  if (!is.null(sample_id_col)) sample_id <- sample_id_col
+  if (!is.null(treatment_col)) treatment <- treatment_col
+  if (!is.null(cell_type_col)) cell_type <- cell_type_col
+  if (!is.null(focus_celltypes)) cell_types <- focus_celltypes
+  if (!is.null(treatment_learner)) donor_model <- treatment_learner
+  if (!is.null(outcome_learner)) outcome_model <- outcome_learner
 
   meta <- as.data.frame(meta, stringsAsFactors = FALSE)
-  meta$.donor_id <- as.character(meta[[donor_id_col]])
-  meta$.sample_id <- as.character(meta[[sample_id_col]])
-  meta$.D <- as.integer(meta[[treatment_col]])
-  meta$.CellType <- as.character(meta[[cell_type_col]])
+  if (is.null(sample_id)) {
+    sample_id <- donor_id
+  }
+
+  donor_res <- .resolve_input_column(meta, donor_id, "donor_id")
+  sample_res <- .resolve_input_column(meta, sample_id, "sample_id")
+  treatment_res <- .resolve_input_column(meta, treatment, "treatment")
+  celltype_res <- .resolve_input_column(meta, cell_type, "cell_type")
+
+  meta$.donor_id <- as.character(donor_res$values)
+  meta$.sample_id <- as.character(sample_res$values)
+  meta$.D <- as.integer(treatment_res$values)
+  meta$.CellType <- as.character(celltype_res$values)
 
   if (!all(meta$.D %in% c(0L, 1L))) {
     stop("Treatment column must be coded as 0/1.", call. = FALSE)
@@ -442,8 +549,8 @@ dedml_fit <- function(
   }
   n_cores <- min(n_cores, parallel::detectCores(logical = TRUE))
 
-  if (!is.null(focus_celltypes)) {
-    keep_cells <- meta$.CellType %in% focus_celltypes
+  if (!is.null(cell_types)) {
+    keep_cells <- meta$.CellType %in% cell_types
     counts <- counts[, keep_cells, drop = FALSE]
     meta <- meta[keep_cells, , drop = FALSE]
   }
@@ -462,10 +569,6 @@ dedml_fit <- function(
   }
 
   needed_cols <- unique(c(
-    donor_id_col,
-    sample_id_col,
-    treatment_col,
-    cell_type_col,
     treatment_confounders,
     treatment_cell_summaries,
     outcome_confounders
@@ -531,7 +634,7 @@ dedml_fit <- function(
       x_train = x_treat[train_idx, , drop = FALSE],
       y_train = donor_meta$.D[train_idx],
       x_test = x_treat[test_idx, , drop = FALSE],
-      learner = treatment_learner,
+      learner = donor_model,
       params = treatment_params
     )
   }
@@ -564,7 +667,7 @@ dedml_fit <- function(
         x_train = x_outcome[train_idx, , drop = FALSE],
         y_train = y_obs[train_idx],
         x_test = x_outcome[test_idx, , drop = FALSE],
-        learner = outcome_learner,
+        learner = outcome_model,
         params = outcome_params
       )
     }
@@ -628,16 +731,16 @@ dedml_fit <- function(
   result_df <- dplyr::ungroup(result_df)
 
   settings <- list(
-    donor_id_col = donor_id_col,
-    sample_id_col = sample_id_col,
-    treatment_col = treatment_col,
-    cell_type_col = cell_type_col,
+    donor_id = donor_res$source,
+    sample_id = sample_res$source,
+    treatment = treatment_res$source,
+    cell_type = celltype_res$source,
     treatment_confounders = treatment_confounders,
     treatment_cell_summaries = treatment_cell_summaries,
     outcome_confounders = outcome_confounders,
     n_folds = n_folds,
-    treatment_learner = treatment_learner,
-    outcome_learner = outcome_learner,
+    donor_model = donor_model,
+    outcome_model = outcome_model,
     min_cells_per_sample_ct = min_cells_per_sample_ct,
     min_samples_per_celltype = min_samples_per_celltype,
     seed = seed
@@ -659,10 +762,10 @@ dedml_fit <- function(
 #' @param object Seurat object.
 #' @param assay Assay to use.
 #' @param layer Layer to use for counts.
-#' @param donor_id_col Donor identifier column in `object@meta.data`.
-#' @param sample_id_col Sample identifier column. If `NULL`, uses donor id.
-#' @param treatment_col Binary treatment indicator column (0/1).
-#' @param cell_type_col Cell type column.
+#' @param donor_id Donor identifier column in `object@meta.data`.
+#' @param sample_id Sample identifier column. If `NULL`, donor id is used.
+#' @param treatment Binary treatment indicator column (0/1).
+#' @param cell_type Cell type column.
 #' @param ... Additional arguments passed to [dedml_fit()].
 #'
 #' @return A list with `results`, `donor_meta`, `settings`, and `errors`.
@@ -672,10 +775,10 @@ dedml_fit_seurat <- function(
     object,
     assay = "RNA",
     layer = "counts",
-    donor_id_col = "HATIMID",
-    sample_id_col = NULL,
-    treatment_col = "D",
-    cell_type_col = "celltype_manual",
+    donor_id = "HATIMID",
+    sample_id = NULL,
+    treatment = "D",
+    cell_type = "celltype_manual",
     ...) {
   if (!requireNamespace("Seurat", quietly = TRUE)) {
     stop("Package 'Seurat' is required for dedml_fit_seurat().", call. = FALSE)
@@ -683,19 +786,19 @@ dedml_fit_seurat <- function(
 
   meta <- object@meta.data
 
-  if (!(donor_id_col %in% colnames(meta))) {
-    stop("donor_id_col not found in Seurat metadata: ", donor_id_col, call. = FALSE)
+  if (!(donor_id %in% colnames(meta))) {
+    stop("donor_id not found in Seurat metadata: ", donor_id, call. = FALSE)
   }
 
-  if (is.null(sample_id_col)) {
-    sample_id_col <- donor_id_col
+  if (is.null(sample_id)) {
+    sample_id <- donor_id
   }
 
-  if (!(sample_id_col %in% colnames(meta))) {
-    stop("sample_id_col not found in Seurat metadata: ", sample_id_col, call. = FALSE)
+  if (!(sample_id %in% colnames(meta))) {
+    stop("sample_id not found in Seurat metadata: ", sample_id, call. = FALSE)
   }
 
-  required <- c(treatment_col, cell_type_col)
+  required <- c(treatment, cell_type)
   missing_required <- setdiff(required, colnames(meta))
   if (length(missing_required) > 0L) {
     stop("Missing required Seurat metadata columns: ", paste(missing_required, collapse = ", "), call. = FALSE)
@@ -706,10 +809,10 @@ dedml_fit_seurat <- function(
   dedml_fit(
     counts = counts,
     meta = meta,
-    donor_id_col = donor_id_col,
-    sample_id_col = sample_id_col,
-    treatment_col = treatment_col,
-    cell_type_col = cell_type_col,
+    donor_id = donor_id,
+    sample_id = sample_id,
+    treatment = treatment,
+    cell_type = cell_type,
     ...
   )
 }

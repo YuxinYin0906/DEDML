@@ -6,10 +6,10 @@ dedml_fit_seurat(
   object,
   assay = "RNA",
   layer = "counts",
-  donor_id_col = "HATIMID",
-  sample_id_col = NULL,
-  treatment_col = "D",
-  cell_type_col = "celltype_manual",
+  donor_id = "HATIMID",
+  sample_id = NULL,
+  treatment = "D",
+  cell_type = "celltype_manual",
   ...
 )
 }
@@ -17,10 +17,10 @@ dedml_fit_seurat(
 \item{object}{Seurat object.}
 \item{assay}{Assay name.}
 \item{layer}{Layer name for counts.}
-\item{donor_id_col}{Donor id column.}
-\item{sample_id_col}{Sample id column; defaults to donor id.}
-\item{treatment_col}{Binary treatment column.}
-\item{cell_type_col}{Cell type column.}
+\item{donor_id}{Donor id metadata column.}
+\item{sample_id}{Sample id metadata column; defaults to donor id.}
+\item{treatment}{Binary treatment metadata column.}
+\item{cell_type}{Cell type metadata column.}
 \item{...}{Arguments passed to \code{dedml_fit}.}
 }
 \value{
