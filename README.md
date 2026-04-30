@@ -83,8 +83,8 @@ head(fit$results)
 
 `fit$results$estimate` is the DEDML effect on the residual scale used for
 testing. The output also includes `estimate_logfc`, a practical post-hoc log
-fold-change effect size. The conversion uses the out-of-fold nuisance mean
-factor matching `outcome_distribution`: `"gaussian"` and `"poisson"` use the
-Poisson factor, while `"nb"` uses the negative-binomial factor. The p-values,
-adjusted p-values, and test statistics remain based on the residual-scale DEDML
-regression.
+fold-change effect size targeting the untreated-baseline mean. The conversion
+uses the out-of-fold nuisance mean and treatment propensity: `"gaussian"` and
+`"poisson"` use the Poisson residual scale, while `"nb"` uses the
+negative-binomial residual scale. The p-values, adjusted p-values, and test
+statistics remain based on the residual-scale DEDML regression.

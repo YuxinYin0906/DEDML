@@ -104,10 +104,11 @@ genes materialized together for batched residual regression.}
 A list with \code{results}, \code{donor_meta}, \code{settings}, and \code{errors}.
 The \code{results} table reports the residual-scale DEDML effect in
 \code{estimate}. It also includes \code{estimate_logfc}, a practical post-hoc
-log fold-change effect size converted with the out-of-fold nuisance mean factor
-matching \code{outcome_distribution}: \code{"gaussian"} and \code{"poisson"}
-use the Poisson factor, while \code{"nb"} uses the negative-binomial factor.
-DEDML inference uses the residual-scale statistic and p-value.
+log fold-change effect size targeting the untreated-baseline mean. The
+conversion uses the out-of-fold nuisance mean and treatment propensity:
+\code{"gaussian"} and \code{"poisson"} use the Poisson residual scale, while
+\code{"nb"} uses the negative-binomial residual scale. DEDML inference uses the
+residual-scale statistic and p-value.
 }
 \description{
 Run donor-blocked cross-fitted double machine learning with configurable

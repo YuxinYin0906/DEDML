@@ -600,33 +600,106 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   out
 }
 
-.summarise_oof_mu_factors <- function(mu, cell_type, nb_size = NA_real_) {
+.dedml_logfc_from_counterfactual_residual <- function(
+    estimate,
+    mu,
+    propensity,
+    outcome_distribution = c("gaussian", "poisson", "nb"),
+    nb_size = NA_real_) {
+  outcome_distribution <- match.arg(outcome_distribution)
+  estimate <- suppressWarnings(as.numeric(estimate))[1]
+  mu <- pmax(suppressWarnings(as.numeric(mu)), 1e-8)
+  propensity <- suppressWarnings(as.numeric(propensity))
+
+  ok <- is.finite(mu) & is.finite(propensity)
+  mu <- mu[ok]
+  propensity <- pmin(pmax(propensity[ok], 1e-6), 1 - 1e-6)
+  if (!is.finite(estimate) || length(mu) == 0L) {
+    return(NA_real_)
+  }
+  if (abs(estimate) < 1e-12) {
+    return(0)
+  }
+
+  if (outcome_distribution == "nb") {
+    nb_size <- suppressWarnings(as.numeric(nb_size))[1]
+    if (!is.finite(nb_size) || nb_size <= 0) {
+      return(NA_real_)
+    }
+    scale <- mu / sqrt(pmax(mu + mu^2 / nb_size, 1e-8))
+  } else {
+    scale <- sqrt(mu)
+  }
+
+  objective <- function(delta) {
+    mean(scale * delta / (1 + propensity * delta), na.rm = TRUE) - estimate
+  }
+
+  lower <- -0.999999
+  if (estimate < 0) {
+    f_lower <- objective(lower)
+    if (!is.finite(f_lower) || f_lower > 0) {
+      return(NA_real_)
+    }
+    root <- stats::uniroot(objective, lower = lower, upper = 0, tol = 1e-8)$root
+    return(log1p(root))
+  }
+
+  upper <- 1
+  f_upper <- objective(upper)
+  while (is.finite(f_upper) && f_upper < 0 && upper < 1e6) {
+    upper <- upper * 2
+    f_upper <- objective(upper)
+  }
+  if (!is.finite(f_upper) || f_upper < 0) {
+    return(NA_real_)
+  }
+  root <- stats::uniroot(objective, lower = 0, upper = upper, tol = 1e-8)$root
+  log1p(root)
+}
+
+.summarise_oof_mu_factors <- function(mu, cell_type, nb_size = NA_real_, propensity = NULL) {
   mu <- pmax(as.numeric(mu), 1e-8)
   cell_type <- as.character(cell_type)
   nb_size <- suppressWarnings(as.numeric(nb_size))[1]
+  has_propensity <- !is.null(propensity)
+  if (is.null(propensity)) {
+    propensity <- rep(NA_real_, length(mu))
+  }
+  propensity <- suppressWarnings(as.numeric(propensity))
   cell_types <- sort(unique(cell_type))
   out <- lapply(cell_types, function(ct) {
     idx <- cell_type == ct
     mu_ct <- mu[idx]
+    propensity_ct <- propensity[idx]
     factor_poisson <- mean(sqrt(mu_ct), na.rm = TRUE)
     factor_nb <- if (is.finite(nb_size) && nb_size > 0) {
       mean(mu_ct / sqrt(mu_ct + mu_ct^2 / nb_size), na.rm = TRUE)
     } else {
       NA_real_
     }
-    data.frame(
+    ans <- data.table::data.table(
       CellType = ct,
       muhat_mean = mean(mu_ct, na.rm = TRUE),
       muhat_factor_poisson = factor_poisson,
       muhat_factor_nb = factor_nb,
       muhat_nb_size = nb_size,
-      stringsAsFactors = FALSE
+      muhat_propensity_mean = mean(propensity_ct, na.rm = TRUE)
     )
+    if (has_propensity) {
+      ans$.muhat_mu <- list(mu_ct)
+      ans$.muhat_propensity <- list(propensity_ct)
+    }
+    ans
   })
   data.table::rbindlist(out, fill = TRUE)
 }
 
-.summarise_oof_mu_factors_matrix <- function(mu_hat_mat, cell_type, nb_size = NA_real_) {
+.summarise_oof_mu_factors_matrix <- function(
+    mu_hat_mat,
+    cell_type,
+    nb_size = NA_real_,
+    propensity = NULL) {
   mu_hat_mat <- as.matrix(mu_hat_mat)
   gene_names <- rownames(mu_hat_mat)
   if (is.null(gene_names)) {
@@ -636,7 +709,8 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     ans <- .summarise_oof_mu_factors(
       mu = mu_hat_mat[i, ],
       cell_type = cell_type,
-      nb_size = if (length(nb_size) >= i) nb_size[i] else nb_size[1]
+      nb_size = if (length(nb_size) >= i) nb_size[i] else nb_size[1],
+      propensity = propensity
     )
     ans$gene <- gene_names[i]
     ans
@@ -663,12 +737,27 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   } else {
     result_df$muhat_factor_poisson
   }
-  result_df$estimate_logfc <- .dedml_logfc_from_residual(
-    result_df$estimate,
-    result_df$muhat_factor
-  )
+  has_counterfactual_inputs <- all(c(".muhat_mu", ".muhat_propensity") %in% names(result_df))
+  if (has_counterfactual_inputs) {
+    result_df$estimate_logfc <- mapply(
+      FUN = .dedml_logfc_from_counterfactual_residual,
+      estimate = result_df$estimate,
+      mu = result_df$.muhat_mu,
+      propensity = result_df$.muhat_propensity,
+      nb_size = result_df$muhat_nb_size,
+      MoreArgs = list(outcome_distribution = outcome_distribution),
+      SIMPLIFY = TRUE
+    )
+  } else {
+    result_df$estimate_logfc <- .dedml_logfc_from_residual(
+      result_df$estimate,
+      result_df$muhat_factor
+    )
+  }
   result_df$muhat_factor_poisson <- NULL
   result_df$muhat_factor_nb <- NULL
+  result_df$.muhat_mu <- NULL
+  result_df$.muhat_propensity <- NULL
   result_df
 }
 
@@ -1113,7 +1202,8 @@ fit_residual_regression_pseudobulk_matrix <- function(
   mu_factor_df <- .summarise_oof_mu_factors_matrix(
     mu_hat_mat = mu_hat_mat,
     cell_type = state$cell_type,
-    nb_size = NA_real_
+    nb_size = NA_real_,
+    propensity = state$propensity
   )
   y_obs_mat <- as.matrix(state$counts[indices, , drop = FALSE])
   y_resid_mat <- (y_obs_mat - pmax(y_resid_mat, 1e-6)) / sqrt(pmax(y_resid_mat, 1e-6))
@@ -1185,10 +1275,11 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @return A list with `results`, `donor_meta`, `settings`, and `errors`.
 #' The `results` table reports the residual-scale DEDML effect in `estimate`.
 #' It also includes `estimate_logfc`, a practical post-hoc log fold-change
-#' effect size converted with the out-of-fold nuisance mean factor matching
-#' `outcome_distribution` (`"gaussian"` and `"poisson"` use the Poisson factor;
-#' `"nb"` uses the negative-binomial factor). DEDML inference uses the
-#' residual-scale statistic and p-value.
+#' effect size targeting the untreated-baseline mean. The conversion uses the
+#' out-of-fold nuisance mean and treatment propensity; `"gaussian"` and
+#' `"poisson"` use the Poisson residual scale, while `"nb"` uses the
+#' negative-binomial residual scale. DEDML inference uses the residual-scale
+#' statistic and p-value.
 #' @export
 #'
 dedml_fit <- function(
@@ -1410,7 +1501,7 @@ dedml_fit <- function(
 
   meta <- dplyr::left_join(
     meta,
-    donor_meta[, c(".donor_id", "D_resid"), drop = FALSE],
+    donor_meta[, c(".donor_id", "D_resid", "propensity_oof"), drop = FALSE],
     by = ".donor_id"
   )
 
@@ -1491,7 +1582,8 @@ dedml_fit <- function(
     mu_summary <- .summarise_oof_mu_factors(
       mu = mu_hat,
       cell_type = meta$.CellType,
-      nb_size = lgb_nb_size
+      nb_size = lgb_nb_size,
+      propensity = meta$propensity_oof
     )
     mu_summary$gene <- gene_names[g_idx]
 
@@ -1607,7 +1699,8 @@ dedml_fit <- function(
       mu_factor_df <- .summarise_oof_mu_factors_matrix(
         mu_hat_mat = mu_hat_mat,
         cell_type = meta$.CellType,
-        nb_size = NA_real_
+        nb_size = NA_real_,
+        propensity = meta$propensity_oof
       )
       rr <- fit_residual_regression_pseudobulk_matrix(
         y_resid_mat = y_resid_mat,
@@ -1706,6 +1799,7 @@ dedml_fit <- function(
         gene_names = gene_names,
         fold_plan = fold_plan,
         cell_type = meta$.CellType,
+        propensity = meta$propensity_oof,
         glm_maxit = glm_maxit,
         glm_epsilon = glm_epsilon
       )
@@ -1791,7 +1885,8 @@ dedml_fit <- function(
         mu_factor_df <- .summarise_oof_mu_factors_matrix(
           mu_hat_mat = mu_hat_mat,
           cell_type = meta$.CellType,
-          nb_size = NA_real_
+          nb_size = NA_real_,
+          propensity = meta$propensity_oof
         )
         list(y_resid_mat = y_resid_mat, mu_factor_df = mu_factor_df)
       })
@@ -1862,7 +1957,8 @@ dedml_fit <- function(
     ".add_lgb_datasets_to_fold_plan", ".finalize_lgb_datasets_in_fold_plan",
     ".compute_outcome_residual",
     ".summarise_oof_mu_factors", ".summarise_oof_mu_factors_matrix",
-    ".dedml_logfc_from_residual", ".append_logfc_effect_sizes",
+    ".dedml_logfc_from_residual", ".dedml_logfc_from_counterfactual_residual",
+    ".append_logfc_effect_sizes",
     "fit_residual_regression_pseudobulk",
     "fit_residual_regression_pseudobulk_matrix"
   )

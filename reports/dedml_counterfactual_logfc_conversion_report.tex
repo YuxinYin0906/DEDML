@@ -1,0 +1,221 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+
+\title{\textbf{Counterfactual LogFC Conversion for Residual-Scale DEDML Estimates}}
+\author{Prepared for Yuxin Yin}
+\date{April 30, 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Motivation}
+
+DEDML estimates treatment effects after outcome residualization and treatment
+residualization. Its primary coefficient,
+\[
+  \widehat{\beta}_{gc}^{\mathrm{res}},
+\]
+is therefore on a standardized residual scale for gene \(g\) and cell type
+\(c\), not directly on the natural-log fold-change scale.
+
+The earlier post-hoc conversion used the fitted nuisance mean
+\(\widehat m(X)=\widehat E(Y\mid X)\) as if it were the untreated baseline
+mean. This is not generally correct. If treatment is associated with
+confounders, then
+\[
+  m(X)
+  =
+  E(Y\mid X)
+  =
+  \mu_0(X)\{1+e(X)(\exp(\tau)-1)\},
+\]
+where
+\[
+  e(X)=P(D=1\mid X),
+  \qquad
+  \mu_0(X)=E(Y\mid D=0,X).
+\]
+Thus \(m(X)\) is a treatment-prevalence-weighted mixture, not the control
+counterfactual mean. The reported logFC should target \(\tau\), the effect
+relative to \(\mu_0(X)\).
+
+\section*{New Conversion}
+
+Let
+\[
+  \delta=\exp(\tau)-1.
+\]
+Because
+\[
+  m_i = \mu_{0i}(1+\widehat e_i\delta),
+\]
+we can write the untreated baseline as
+\[
+  \mu_{0i} = \frac{m_i}{1+\widehat e_i\delta}.
+\]
+
+For Poisson-scale residuals, the residualized mean shift induced by \(\delta\)
+is approximately
+\[
+  \frac{\mu_{0i}\delta}{\sqrt{m_i}}
+  =
+  \frac{\sqrt{m_i}\delta}{1+\widehat e_i\delta}.
+\]
+Therefore the corrected conversion solves the one-dimensional equation
+\[
+  \widehat{\beta}_{gc}^{\mathrm{res}}
+  =
+  \frac{1}{n_{gc}}
+  \sum_{i:C_i=c}
+  \frac{\sqrt{\widehat m_{ig}}\delta}
+       {1+\widehat e_i\delta},
+\]
+and then reports
+\[
+  \widehat\tau_{gc} = \log(1+\widehat\delta_{gc}).
+\]
+
+For negative-binomial residuals with size parameter \(\widehat\phi_g\), the
+same idea is used with the NB residual scale:
+\[
+  \widehat{\beta}_{gc}^{\mathrm{res}}
+  =
+  \frac{1}{n_{gc}}
+  \sum_{i:C_i=c}
+  \frac{
+    \widehat m_{ig}\delta
+  }{
+    \{1+\widehat e_i\delta\}
+    \sqrt{\widehat m_{ig}+\widehat m_{ig}^2/\widehat\phi_g}
+  }.
+\]
+The solution again gives
+\[
+  \widehat\tau_{gc} = \log(1+\widehat\delta_{gc}).
+\]
+
+The inference remains unchanged. DEDML p-values and test statistics continue
+to use the residual-scale regression. The new conversion only changes the
+reported effect-size column \texttt{estimate\_logfc}.
+
+\section*{Implementation}
+
+The DEDML package now stores the cross-fitted treatment propensity
+\(\widehat e_i\) alongside the outcome residual quantities. For each
+gene-celltype result row, \texttt{estimate\_logfc} is computed by numerically
+solving the equation above. The output also includes summary diagnostics:
+\[
+  \texttt{muhat\_mean},
+  \qquad
+  \texttt{muhat\_factor},
+  \qquad
+  \texttt{muhat\_propensity\_mean},
+  \qquad
+  \texttt{muhat\_nb\_size}.
+\]
+
+The package version was bumped to \texttt{0.1.2}.
+
+\section*{Benchmark Design}
+
+We benchmarked the conversion on the observed-confounding synthetic
+single-cell setting:
+\begin{itemize}
+  \item donors: 50;
+  \item genes: 500;
+  \item cell types: 6;
+  \item repeated samples per donor: none;
+  \item mean cells per sample: 700;
+  \item DE gene fraction: 8\%;
+  \item DE cell types per DE gene: 2;
+  \item simulated natural-log fold-change magnitude: around 0.45;
+  \item DEDML folds: 3;
+  \item cores: 20;
+  \item donor model: logistic GLM;
+  \item outcome model: Poisson GLM with batched exact IRLS.
+\end{itemize}
+
+The treatment model produced nontrivial estimated propensities:
+\[
+\begin{array}{lr}
+\text{donors} & 50 \\
+\text{treated donors} & 24 \\
+\min(\widehat e) & 0.0001 \\
+\max(\widehat e) & 0.9999 \\
+\operatorname{mean}(\widehat e) & 0.458 \\
+\operatorname{sd}(\widehat e) & 0.499 \\
+\operatorname{mean}(\widehat e\mid D=1) & 0.577 \\
+\operatorname{mean}(\widehat e\mid D=0) & 0.349
+\end{array}
+\]
+
+\section*{Algebraic Check}
+
+First, we tested the conversion directly under known residual-scale effects.
+The new conversion recovers the true untreated-baseline logFC to numerical
+precision, while the old mixed-mean conversion can be severely biased.
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Distribution & Old mean abs. error & Old max abs. error & New mean abs. error & New max abs. error \\
+\midrule
+Poisson & 0.423 & 2.938 & \(8.3\times10^{-10}\) & \(3.2\times10^{-9}\) \\
+NB      & 0.445 & 3.196 & \(8.2\times10^{-10}\) & \(3.3\times10^{-9}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{End-to-End DEDML Results}
+
+The table below compares the old mixed-mean conversion with the new
+untreated-baseline conversion against the simulated truth. The hypothesis test
+is unchanged, so FDR and power are not affected by this conversion.
+
+\begin{center}
+\begin{tabular}{lrrrrrr}
+\toprule
+Conversion & Kendall DE & Spearman DE & Pearson DE & Bias DE & MAE DE & RMSE DE \\
+\midrule
+Old mixed mean & 0.572 & 0.794 & 0.891 & -0.048 & 0.215 & 0.250 \\
+New untreated baseline & 0.571 & 0.793 & 0.896 & -0.006 & 0.225 & 0.253 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The main empirical improvement is bias reduction: the old conversion
+underestimates DE logFC by about \(-0.048\), whereas the new conversion reduces
+this bias to about \(-0.006\). Correlations are similar because, in the
+end-to-end benchmark, much of the remaining error comes from the residual-scale
+DEDML estimate itself rather than from the scale conversion.
+
+\section*{Interpretation}
+
+The new conversion fixes the target mismatch. It reports an effect size on the
+untreated-baseline logFC scale using only estimable quantities:
+\[
+  \widehat m(X),
+  \qquad
+  \widehat e(X),
+  \qquad
+  \widehat\phi_g \text{ for NB}.
+\]
+It does not use simulation truth and therefore is applicable to real data.
+
+The remaining caveat is that \texttt{estimate\_logfc} is still a post-hoc
+effect-size interpretation of a residual-scale DEDML coefficient. It should be
+reported together with the residual-scale estimate, statistic, and p-value.
+
+\end{document}
