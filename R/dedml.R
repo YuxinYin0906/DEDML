@@ -419,6 +419,9 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
 
   dtrain <- params$.lgb_dataset
   params$.lgb_dataset <- NULL
+  gc_after_fit <- isTRUE(params$.gc_after_fit)
+  params$.gc_after_fit <- NULL
+  params$.reuse_lgb_dataset <- NULL
 
   merged_params <- utils::modifyList(default_params, params)
   effective_objective <- merged_params$objective
@@ -476,7 +479,9 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     try(dtrain$.__enclos_env__$private$finalize(), silent = TRUE)
   }
   rm(fit)
-  gc()
+  if (isTRUE(gc_after_fit)) {
+    gc(FALSE)
+  }
   pred
 }
 
@@ -521,6 +526,33 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   stop("Unsupported outcome learner: ", learner, call. = FALSE)
 }
 
+.add_lgb_datasets_to_fold_plan <- function(fold_plan, outcome_params) {
+  if (!requireNamespace("lightgbm", quietly = TRUE)) {
+    stop("Package 'lightgbm' is required for learner='lightgbm'.", call. = FALSE)
+  }
+  lapply(fold_plan, function(fold) {
+    dtrain <- lightgbm::lgb.Dataset(
+      data = fold$x_train,
+      label = rep.int(0, nrow(fold$x_train))
+    )
+    fold$params <- utils::modifyList(
+      outcome_params,
+      list(.lgb_dataset = dtrain)
+    )
+    fold
+  })
+}
+
+.finalize_lgb_datasets_in_fold_plan <- function(fold_plan) {
+  for (fold in fold_plan) {
+    dtrain <- fold$params$.lgb_dataset
+    if (!is.null(dtrain)) {
+      try(dtrain$.__enclos_env__$private$finalize(), silent = TRUE)
+    }
+  }
+  invisible(TRUE)
+}
+
 .compute_outcome_residual <- function(
     y,
     mu,
@@ -558,6 +590,86 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     attr(resid, "nb_size") <- size
     return(resid)
   }
+}
+
+.dedml_logfc_from_residual <- function(estimate, factor) {
+  x <- as.numeric(estimate) / pmax(as.numeric(factor), 1e-8)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x) & x > -0.999999
+  out[ok] <- log1p(x[ok])
+  out
+}
+
+.summarise_oof_mu_factors <- function(mu, cell_type, nb_size = NA_real_) {
+  mu <- pmax(as.numeric(mu), 1e-8)
+  cell_type <- as.character(cell_type)
+  nb_size <- suppressWarnings(as.numeric(nb_size))[1]
+  cell_types <- sort(unique(cell_type))
+  out <- lapply(cell_types, function(ct) {
+    idx <- cell_type == ct
+    mu_ct <- mu[idx]
+    factor_poisson <- mean(sqrt(mu_ct), na.rm = TRUE)
+    factor_nb <- if (is.finite(nb_size) && nb_size > 0) {
+      mean(mu_ct / sqrt(mu_ct + mu_ct^2 / nb_size), na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+    data.frame(
+      CellType = ct,
+      muhat_mean = mean(mu_ct, na.rm = TRUE),
+      muhat_factor_poisson = factor_poisson,
+      muhat_factor_nb = factor_nb,
+      muhat_nb_size = nb_size,
+      stringsAsFactors = FALSE
+    )
+  })
+  data.table::rbindlist(out, fill = TRUE)
+}
+
+.summarise_oof_mu_factors_matrix <- function(mu_hat_mat, cell_type, nb_size = NA_real_) {
+  mu_hat_mat <- as.matrix(mu_hat_mat)
+  gene_names <- rownames(mu_hat_mat)
+  if (is.null(gene_names)) {
+    gene_names <- paste0("gene_", seq_len(nrow(mu_hat_mat)))
+  }
+  out <- lapply(seq_len(nrow(mu_hat_mat)), function(i) {
+    ans <- .summarise_oof_mu_factors(
+      mu = mu_hat_mat[i, ],
+      cell_type = cell_type,
+      nb_size = if (length(nb_size) >= i) nb_size[i] else nb_size[1]
+    )
+    ans$gene <- gene_names[i]
+    ans
+  })
+  data.table::rbindlist(out, fill = TRUE)
+}
+
+.append_logfc_effect_sizes <- function(
+    result_df,
+    mu_factor_df,
+    outcome_distribution = c("gaussian", "poisson", "nb")) {
+  outcome_distribution <- match.arg(outcome_distribution)
+  if (!is.data.frame(result_df) || nrow(result_df) == 0L ||
+      is.null(mu_factor_df) || nrow(mu_factor_df) == 0L) {
+    return(result_df)
+  }
+  result_df <- dplyr::left_join(
+    result_df,
+    as.data.frame(mu_factor_df),
+    by = c("gene", "CellType")
+  )
+  result_df$muhat_factor <- if (outcome_distribution == "nb") {
+    result_df$muhat_factor_nb
+  } else {
+    result_df$muhat_factor_poisson
+  }
+  result_df$estimate_logfc <- .dedml_logfc_from_residual(
+    result_df$estimate,
+    result_df$muhat_factor
+  )
+  result_df$muhat_factor_poisson <- NULL
+  result_df$muhat_factor_nb <- NULL
+  result_df
 }
 
 fit_residual_regression_pseudobulk <- function(
@@ -997,10 +1109,16 @@ fit_residual_regression_pseudobulk_matrix <- function(
     )
     y_resid_mat[, fold$test_idx] <- t(pred)
   }
+  mu_hat_mat <- y_resid_mat
+  mu_factor_df <- .summarise_oof_mu_factors_matrix(
+    mu_hat_mat = mu_hat_mat,
+    cell_type = state$cell_type,
+    nb_size = NA_real_
+  )
   y_obs_mat <- as.matrix(state$counts[indices, , drop = FALSE])
   y_resid_mat <- (y_obs_mat - pmax(y_resid_mat, 1e-6)) / sqrt(pmax(y_resid_mat, 1e-6))
   rownames(y_resid_mat) <- state$gene_names[indices]
-  y_resid_mat
+  list(y_resid_mat = y_resid_mat, mu_factor_df = mu_factor_df)
 }
 
 #' Fit DEDML on Cell-Level Data
@@ -1065,6 +1183,12 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @param outcome_learner Deprecated alias for `outcome_model`.
 #'
 #' @return A list with `results`, `donor_meta`, `settings`, and `errors`.
+#' The `results` table reports the residual-scale DEDML effect in `estimate`.
+#' It also includes `estimate_logfc`, a practical post-hoc log fold-change
+#' effect size converted with the out-of-fold nuisance mean factor matching
+#' `outcome_distribution` (`"gaussian"` and `"poisson"` use the Poisson factor;
+#' `"nb"` uses the negative-binomial factor). DEDML inference uses the
+#' residual-scale statistic and p-value.
 #' @export
 #'
 dedml_fit <- function(
@@ -1339,11 +1463,11 @@ dedml_fit <- function(
     })
   }
 
-  run_one_gene <- function(g_idx) {
+  run_one_gene <- function(g_idx, gene_fold_plan = fold_plan) {
     y_obs <- as.numeric(counts[g_idx, ])
     mu_hat <- rep(NA_real_, length(y_obs))
     nb_sizes <- numeric(0)
-    for (fold in fold_plan) {
+    for (fold in gene_fold_plan) {
       fold_pred <- .fit_predict_outcome(
         x_train = fold$x_train,
         y_train = y_obs[fold$train_idx],
@@ -1364,6 +1488,12 @@ dedml_fit <- function(
     if (!is.finite(lgb_nb_size)) {
       lgb_nb_size <- NA_real_
     }
+    mu_summary <- .summarise_oof_mu_factors(
+      mu = mu_hat,
+      cell_type = meta$.CellType,
+      nb_size = lgb_nb_size
+    )
+    mu_summary$gene <- gene_names[g_idx]
 
     y_resid <- .compute_outcome_residual(
       y = y_obs,
@@ -1379,7 +1509,8 @@ dedml_fit <- function(
       gene_idx = g_idx,
       gene = gene_names[g_idx],
       y_resid = y_resid,
-      nb_size = attr(y_resid, "nb_size")
+      nb_size = attr(y_resid, "nb_size"),
+      mu_summary = mu_summary
     )
   }
 
@@ -1473,7 +1604,12 @@ dedml_fit <- function(
       y_obs_mat <- as.matrix(counts[indices, , drop = FALSE])
       y_resid_mat <- (y_obs_mat - pmax(mu_hat_mat, 1e-6)) / sqrt(pmax(mu_hat_mat, 1e-6))
       rownames(y_resid_mat) <- block_gene_names
-      fit_residual_regression_pseudobulk_matrix(
+      mu_factor_df <- .summarise_oof_mu_factors_matrix(
+        mu_hat_mat = mu_hat_mat,
+        cell_type = meta$.CellType,
+        nb_size = NA_real_
+      )
+      rr <- fit_residual_regression_pseudobulk_matrix(
         y_resid_mat = y_resid_mat,
         d_resid = meta$D_resid,
         cell_type = meta$.CellType,
@@ -1484,6 +1620,7 @@ dedml_fit <- function(
         min_samples = min_samples_per_celltype,
         cluster_robust = TRUE
       )
+      .append_logfc_effect_sizes(rr, mu_factor_df, outcome_distribution = outcome_distribution)
     })
     result_chunks <- Filter(Negate(is.null), result_chunks)
     result_df_batch <- if (length(result_chunks) > 0L) {
@@ -1539,7 +1676,8 @@ dedml_fit <- function(
     glm_epsilon <- if (!is.null(outcome_params$epsilon)) as.numeric(outcome_params$epsilon) else 1e-8
     poisson_chunks <- gene_chunks
     poisson_resid_to_results <- function(resid_chunks) {
-      result_chunks <- lapply(resid_chunks, function(y_resid_mat) {
+      result_chunks <- lapply(resid_chunks, function(chunk) {
+        y_resid_mat <- if (is.list(chunk) && !is.null(chunk$y_resid_mat)) chunk$y_resid_mat else chunk
         fit_residual_regression_pseudobulk_matrix(
           y_resid_mat = y_resid_mat,
           d_resid = meta$D_resid,
@@ -1556,13 +1694,18 @@ dedml_fit <- function(
       if (length(result_chunks) == 0L) {
         return(NULL)
       }
-      as.data.frame(data.table::rbindlist(result_chunks, fill = TRUE))
+      result_df <- as.data.frame(data.table::rbindlist(result_chunks, fill = TRUE))
+      mu_factor_df <- data.table::rbindlist(lapply(resid_chunks, function(chunk) {
+        if (is.list(chunk) && !is.null(chunk$mu_factor_df)) chunk$mu_factor_df else NULL
+      }), fill = TRUE)
+      .append_logfc_effect_sizes(result_df, mu_factor_df, outcome_distribution = outcome_distribution)
     }
     if (n_cores > 1L) {
       poisson_state <- list(
         counts = counts,
         gene_names = gene_names,
         fold_plan = fold_plan,
+        cell_type = meta$.CellType,
         glm_maxit = glm_maxit,
         glm_epsilon = glm_epsilon
       )
@@ -1585,6 +1728,8 @@ dedml_fit <- function(
           psock_env$.fit_glm_poisson_coef_one <- .fit_glm_poisson_coef_one
           psock_env$.fit_predict_glm_poisson <- .fit_predict_glm_poisson
           psock_env$.fit_predict_glm_poisson_matrix <- .fit_predict_glm_poisson_matrix
+          psock_env$.summarise_oof_mu_factors <- .summarise_oof_mu_factors
+          psock_env$.summarise_oof_mu_factors_matrix <- .summarise_oof_mu_factors_matrix
           psock_env$.dedml_poisson_irls_psock_block <- .dedml_poisson_irls_psock_block
           parallel::clusterExport(
             cl,
@@ -1593,6 +1738,8 @@ dedml_fit <- function(
               ".fit_glm_poisson_coef_one",
               ".fit_predict_glm_poisson",
               ".fit_predict_glm_poisson_matrix",
+              ".summarise_oof_mu_factors",
+              ".summarise_oof_mu_factors_matrix",
               ".dedml_poisson_irls_psock_block"
             ),
             envir = psock_env
@@ -1605,6 +1752,8 @@ dedml_fit <- function(
               .fit_glm_poisson_coef_one,
               .fit_predict_glm_poisson,
               .fit_predict_glm_poisson_matrix,
+              .summarise_oof_mu_factors,
+              .summarise_oof_mu_factors_matrix,
               .dedml_poisson_irls_psock_block,
               envir = .GlobalEnv
             )
@@ -1621,7 +1770,7 @@ dedml_fit <- function(
       }
       result_df_batch <- poisson_resid_to_results(resid_chunks)
     } else {
-      result_chunks <- lapply(poisson_chunks, function(indices) {
+      resid_chunks <- lapply(poisson_chunks, function(indices) {
         block_gene_names <- gene_names[indices]
         mu_hat_mat <- matrix(NA_real_, nrow = length(indices), ncol = ncol(counts))
         rownames(mu_hat_mat) <- block_gene_names
@@ -1639,24 +1788,14 @@ dedml_fit <- function(
         y_obs_mat <- as.matrix(counts[indices, , drop = FALSE])
         y_resid_mat <- (y_obs_mat - pmax(mu_hat_mat, 1e-6)) / sqrt(pmax(mu_hat_mat, 1e-6))
         rownames(y_resid_mat) <- block_gene_names
-        fit_residual_regression_pseudobulk_matrix(
-          y_resid_mat = y_resid_mat,
-          d_resid = meta$D_resid,
+        mu_factor_df <- .summarise_oof_mu_factors_matrix(
+          mu_hat_mat = mu_hat_mat,
           cell_type = meta$.CellType,
-          sample_id = meta$.sample_id,
-          donor_id = meta$.donor_id,
-          gene_names = block_gene_names,
-          min_cells_per_sample_ct = min_cells_per_sample_ct,
-          min_samples = min_samples_per_celltype,
-          cluster_robust = TRUE
+          nb_size = NA_real_
         )
+        list(y_resid_mat = y_resid_mat, mu_factor_df = mu_factor_df)
       })
-      result_chunks <- Filter(Negate(is.null), result_chunks)
-      result_df_batch <- if (length(result_chunks) > 0L) {
-        as.data.frame(data.table::rbindlist(result_chunks, fill = TRUE))
-      } else {
-        NULL
-      }
+      result_df_batch <- poisson_resid_to_results(resid_chunks)
     }
     if (is.data.frame(result_df_batch) && nrow(result_df_batch) > 0L) {
       result_df_batch$nb_size <- NA_real_
@@ -1698,21 +1837,32 @@ dedml_fit <- function(
     ))
   }
 
-  worker_fun <- function(i) {
+  worker_fun <- function(i, gene_fold_plan = fold_plan) {
     tryCatch(
-      run_one_gene(i),
+      run_one_gene(i, gene_fold_plan = gene_fold_plan),
       error = function(e) list(.error = TRUE, gene = gene_names[i], message = conditionMessage(e))
     )
   }
 
   run_gene_block <- function(indices) {
-    lapply(indices, worker_fun)
+    block_fold_plan <- fold_plan
+    if (outcome_model == "lightgbm" && !isFALSE(outcome_params$.reuse_lgb_dataset)) {
+      block_fold_plan <- .add_lgb_datasets_to_fold_plan(fold_plan, outcome_params)
+      on.exit({
+        .finalize_lgb_datasets_in_fold_plan(block_fold_plan)
+        gc(FALSE)
+      }, add = TRUE)
+    }
+    lapply(indices, worker_fun, gene_fold_plan = block_fold_plan)
   }
 
   helper_names <- c(
     ".fit_predict_outcome", ".fit_predict_lightgbm",
     ".fit_predict_glm_gaussian", ".fit_predict_glm_poisson", ".fit_predict_gam_nb",
+    ".add_lgb_datasets_to_fold_plan", ".finalize_lgb_datasets_in_fold_plan",
     ".compute_outcome_residual",
+    ".summarise_oof_mu_factors", ".summarise_oof_mu_factors_matrix",
+    ".dedml_logfc_from_residual", ".append_logfc_effect_sizes",
     "fit_residual_regression_pseudobulk",
     "fit_residual_regression_pseudobulk_matrix"
   )
@@ -1770,6 +1920,14 @@ dedml_fit <- function(
     }), fill = TRUE)
     if (nrow(nb_size_df) > 0L) {
       result_df_batch <- dplyr::left_join(result_df_batch, nb_size_df, by = "gene")
+    }
+    mu_factor_df <- data.table::rbindlist(lapply(resid_list, function(x) x$mu_summary), fill = TRUE)
+    if (nrow(mu_factor_df) > 0L) {
+      result_df_batch <- .append_logfc_effect_sizes(
+        result_df_batch,
+        mu_factor_df,
+        outcome_distribution = outcome_distribution
+      )
     }
   }
   result_list <- if (is.data.frame(result_df_batch) && nrow(result_df_batch) > 0L) {
