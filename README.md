@@ -27,6 +27,14 @@ Use `dedml_fit()` with simplified input names:
 - `cell_types` (which cell types to test)
 - `donor_model` and `outcome_model`
 - `n_cores`
+- `parallel_backend` (`"auto"`, `"fork"`, or `"psock"`)
+
+Parallel gene-level fitting defaults to `parallel_backend = "auto"`. In this
+mode, DEDML uses PSOCK workers when `n_cores > 1`, which is portable across
+Unix-like systems, Windows, and LightGBM-backed runs. `parallel_backend =
+"fork"` is still available as an explicit opt-in on platforms that support it.
+If local socket worker creation is restricted by the environment, DEDML falls
+back to serial execution instead of failing the analysis.
 
 ## Helper functions for confounders and metadata
 
@@ -66,7 +74,8 @@ fit <- dedml_fit(
   donor_model = "glm",
   outcome_model = "lightgbm",
   n_folds = 3,
-  n_cores = 8
+  n_cores = 8,
+  parallel_backend = "auto"
 )
 
 head(fit$results)

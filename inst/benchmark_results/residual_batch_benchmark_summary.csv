@@ -1,0 +1,2 @@
+n_donors,n_genes,n_celltypes,n_cells,n_result_rows_scalar,n_result_rows_batched,scalar_seconds,batched_seconds,speedup,max_abs_estimate_diff,max_abs_se_diff,max_abs_p_diff
+50,2000,6,6000,12000,12000,36.45,1.178,30.9422750424447,2.4980018054066e-16,4.96130914129367e-16,8.49320613838245e-15

@@ -6,6 +6,8 @@ Authors@R: c(
     person(given = "Yuxin", family = "Yin", role = c("aut", "cre"),
            email = "yyin0906@gmail.com")
     )
+Author: Yuxin Yin [aut, cre]
+Maintainer: Yuxin Yin <yyin0906@gmail.com>
 Description: Implements a donor-blocked double machine learning pipeline for
     single-cell differential expression with pseudobulk residual regression.
     Users can choose dataset-specific treatment and outcome confounders,
@@ -24,6 +26,8 @@ Imports:
     utils
 Suggests:
     lightgbm,
+    MASS,
     Matrix,
+    mgcv,
     Seurat
 RoxygenNote: 7.3.2

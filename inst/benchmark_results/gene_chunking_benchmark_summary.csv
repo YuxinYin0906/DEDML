@@ -1,0 +1,3 @@
+scenario,donor_model,outcome_model,n_cores,n_genes,n_cells,chunk1_seconds,auto_chunk_seconds,speedup,chunk1_used_chunk,auto_used_chunk,chunk1_n_chunks,auto_n_chunks,n_rows_a,n_rows_b,n_rows_merged,max_abs_estimate_diff,max_abs_se_diff,max_abs_p_diff
+glm_glm_1000g,glm,glm,20,1000,1200,0.983,0.623,1.57784911717496,1,13,1000,77,3000,3000,3000,0,0,0
+lgb_lgb_200g,lightgbm,lightgbm,20,200,1200,8.603,8.097,1.06249228109176,1,10,200,20,600,600,600,0,0,0

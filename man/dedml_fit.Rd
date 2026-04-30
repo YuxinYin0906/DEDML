@@ -19,10 +19,17 @@ dedml_fit(
   n_cores = 1L,
   donor_model = "glm",
   outcome_model = "lightgbm",
+  outcome_distribution = c("poisson", "gaussian", "nb"),
   treatment_params = list(),
   outcome_params = list(),
   min_cells_per_sample_ct = 10L,
   min_samples_per_celltype = 3L,
+  nb_size_min = 0.1,
+  nb_size_max = 1e+06,
+  pvalue_calibration = c("none", "tail"),
+  calibration_quantile = 0.9,
+  parallel_backend = c("auto", "fork", "psock"),
+  gene_chunk_size = NULL,
   seed = 123L,
   verbose = TRUE,
   donor_id_col = NULL,
@@ -51,10 +58,38 @@ dedml_fit(
 \item{n_cores}{Number of CPU cores for gene-level parallelization.}
 \item{donor_model}{Donor treatment model: \code{"glm"} or \code{"lightgbm"}.}
 \item{outcome_model}{Outcome model: \code{"lightgbm"} or \code{"glm"}.}
+\item{outcome_distribution}{Outcome likelihood/working distribution:
+\code{"gaussian"}, \code{"poisson"}, or \code{"nb"}. For
+\code{outcome_model = "glm"}, Gaussian and Poisson use \code{stats::glm.fit()}
+and NB uses \code{mgcv::gam()} with \code{mgcv::nb()}. For
+\code{outcome_model = "lightgbm"}, these map to LightGBM L2 regression,
+Poisson, and free-dispersion NB objectives. Gaussian/L2 changes only the
+nuisance mean learner; its final residual conversion still uses Poisson
+variance.}
 \item{treatment_params}{Optional donor model hyperparameters.}
-\item{outcome_params}{Optional outcome model hyperparameters.}
+\item{outcome_params}{Optional outcome learner hyperparameters. The outcome
+objective/family is controlled by \code{outcome_distribution}, so redundant
+\code{objective}, \code{metric}, and \code{family} entries are ignored. For
+\code{outcome_model = "glm"} and \code{outcome_distribution = "poisson"},
+\code{batched_irls = TRUE} enables an exact shared-design IRLS implementation;
+it uses \code{n_cores} and \code{parallel_backend} to split genes into
+independent blocks. It is opt-in because the regular parallel scalar
+\code{glm.fit()} path can be faster for some backend/data-size combinations.}
 \item{min_cells_per_sample_ct}{Minimum cells per sample-celltype pseudobulk unit.}
 \item{min_samples_per_celltype}{Minimum pseudobulk samples required per cell type.}
+\item{nb_size_min}{Minimum NB size estimate used for residual conversion.}
+\item{nb_size_max}{Maximum NB size estimate used for residual conversion; large
+values approximate Poisson residuals.}
+\item{pvalue_calibration}{Optional p-value calibration. \code{"tail"} estimates
+cell-type-specific upper-tail statistic inflation before BH adjustment.}
+\item{calibration_quantile}{Chi-square quantile used when
+\code{pvalue_calibration = "tail"}.}
+\item{parallel_backend}{Gene-level parallel backend. With \code{n_cores > 1},
+\code{"auto"} uses PSOCK workers for portability; \code{"fork"} remains
+available as an explicit opt-in on platforms that support it.}
+\item{gene_chunk_size}{Number of genes per parallel task. If \code{NULL},
+DEDML chooses a backend-aware value. This also controls the maximum number of
+genes materialized together for batched residual regression.}
 \item{seed}{Random seed.}
 \item{verbose}{Whether to print progress messages.}
 \item{donor_id_col}{Deprecated alias for \code{donor_id}.}
