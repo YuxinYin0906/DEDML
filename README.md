@@ -13,7 +13,7 @@ remotes::install_github("YuxinYin0906/DEDML")
 From a release/source tarball:
 
 ```r
-install.packages("DEDML_0.1.4.tar.gz", repos = NULL, type = "source")
+install.packages("DEDML_0.1.5.tar.gz", repos = NULL, type = "source")
 ```
 
 ## Main function
@@ -25,7 +25,9 @@ Use `dedml_fit()` with simplified input names:
 - `treatment`
 - `cell_type`
 - `cell_types` (which cell types to test)
-- `donor_model` and `outcome_model`
+- `donor_model`
+- `outcome_model` (`"cell"` or `"pseudobulk"`)
+- `outcome_learner` (`"lightgbm"` or `"glm"`)
 - `outcome_distribution` (`"poisson"` by default; `"gaussian"` and `"nb"` are available)
 - `n_cores`
 - `parallel_backend` (`"auto"`, `"fork"`, or `"psock"`)
@@ -36,6 +38,14 @@ Unix-like systems, Windows, and LightGBM-backed runs. `parallel_backend =
 "fork"` is still available as an explicit opt-in on platforms that support it.
 If local socket worker creation is restricted by the environment, DEDML falls
 back to serial execution instead of failing the analysis.
+
+`outcome_model` controls the level of the nuisance outcome model. Use
+`outcome_model = "cell"` for cell-level nuisance fitting, or
+`outcome_model = "pseudobulk"` to fit the nuisance model on sample-celltype
+pseudo-bulk means. `outcome_learner` controls the learner at either level:
+`"lightgbm"` uses LightGBM and `"glm"` uses GLM/GAM. The pseudo-bulk path uses
+cell-count weights, and the final residual regression is run directly on
+pseudo-bulk residuals.
 
 ## Helper functions for confounders and metadata
 
@@ -89,7 +99,8 @@ fit <- dedml_fit(
   confounder_spec = conf_spec,
   cell_types = c("B cell Ig+", "CD4-EM like", "NK"),
   donor_model = "glm",
-  outcome_model = "lightgbm",
+  outcome_model = "cell",
+  outcome_learner = "lightgbm",
   outcome_distribution = "poisson",
   n_folds = 3,
   n_cores = 8,

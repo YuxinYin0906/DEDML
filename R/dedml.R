@@ -1,7 +1,8 @@
 available_dedml_learners <- function() {
   list(
     donor = c("glm", "lightgbm"),
-    outcome = c("lightgbm", "glm"),
+    outcome_model = c("cell", "pseudobulk"),
+    outcome_learner = c("lightgbm", "glm"),
     outcome_distribution = c("poisson", "gaussian", "nb")
   )
 }
@@ -9,7 +10,8 @@ available_dedml_learners <- function() {
 if (getRversion() >= "2.15.1") {
   utils::globalVariables(c(
     ".CellType", ".DEDML_POISSON_IRLS_STATE", ".DEDML_PSOCK_STATE",
-    ".sample_id", "fold", "level", "tail_lambda", "variable"
+    ".sample_id", ".unit_key", "donor_id", "fold", "level", "sample_id",
+    "tail_lambda", "variable"
   ))
 }
 
@@ -1150,7 +1152,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
 
 .fit_predict_gam_nb <- function(x_train, y_train, x_test, params = list()) {
   if (!requireNamespace("mgcv", quietly = TRUE)) {
-    stop("Package 'mgcv' is required for outcome_model='glm' and outcome_distribution='nb'.", call. = FALSE)
+    stop("Package 'mgcv' is required for outcome_learner='glm' and outcome_distribution='nb'.", call. = FALSE)
   }
 
   nb_train_df_base <- params$.nb_train_df_base
@@ -1193,7 +1195,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   pred
 }
 
-.fit_predict_lightgbm <- function(x_train, y_train, x_test, objective, params = list()) {
+.fit_predict_lightgbm <- function(x_train, y_train, x_test, objective, params = list(), weight_train = NULL) {
   if (!requireNamespace("lightgbm", quietly = TRUE)) {
     stop("Package 'lightgbm' is required for learner='lightgbm'.", call. = FALSE)
   }
@@ -1236,8 +1238,11 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   reuse_dataset <- !is.null(dtrain)
   if (isTRUE(reuse_dataset)) {
     dtrain$set_field("label", as.numeric(y_train))
+    if (!is.null(weight_train)) {
+      dtrain$set_field("weight", as.numeric(weight_train))
+    }
   } else {
-    dtrain <- lightgbm::lgb.Dataset(data = x_train, label = y_train)
+    dtrain <- lightgbm::lgb.Dataset(data = x_train, label = y_train, weight = weight_train)
   }
   fit <- lightgbm::lgb.train(
     params = merged_params,
@@ -1398,15 +1403,22 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     mu,
     propensity,
     outcome_distribution = c("poisson", "gaussian", "nb"),
-    nb_size = NA_real_) {
+    nb_size = NA_real_,
+    weights = NULL) {
   outcome_distribution <- match.arg(outcome_distribution)
   estimate <- suppressWarnings(as.numeric(estimate))[1]
   mu <- pmax(suppressWarnings(as.numeric(mu)), 1e-8)
   propensity <- suppressWarnings(as.numeric(propensity))
+  if (is.null(weights)) {
+    weights <- rep.int(1, length(mu))
+  } else {
+    weights <- suppressWarnings(as.numeric(weights))
+  }
 
-  ok <- is.finite(mu) & is.finite(propensity)
+  ok <- is.finite(mu) & is.finite(propensity) & is.finite(weights) & weights > 0
   mu <- mu[ok]
   propensity <- pmin(pmax(propensity[ok], 1e-6), 1 - 1e-6)
+  weights <- weights[ok]
   if (!is.finite(estimate) || length(mu) == 0L) {
     return(NA_real_)
   }
@@ -1425,7 +1437,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   }
 
   objective <- function(delta) {
-    mean(scale * delta / (1 + propensity * delta), na.rm = TRUE) - estimate
+    stats::weighted.mean(scale * delta / (1 + propensity * delta), w = weights, na.rm = TRUE) - estimate
   }
 
   lower <- -0.999999
@@ -1451,7 +1463,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   log1p(root)
 }
 
-.summarise_oof_mu_factors <- function(mu, cell_type, nb_size = NA_real_, propensity = NULL) {
+.summarise_oof_mu_factors <- function(mu, cell_type, nb_size = NA_real_, propensity = NULL, weights = NULL) {
   mu <- pmax(as.numeric(mu), 1e-8)
   cell_type <- as.character(cell_type)
   nb_size <- suppressWarnings(as.numeric(nb_size))[1]
@@ -1460,28 +1472,43 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     propensity <- rep(NA_real_, length(mu))
   }
   propensity <- suppressWarnings(as.numeric(propensity))
+  if (is.null(weights)) {
+    weights <- rep.int(1, length(mu))
+  }
+  weights <- suppressWarnings(as.numeric(weights))
   cell_types <- sort(unique(cell_type))
   out <- lapply(cell_types, function(ct) {
     idx <- cell_type == ct
     mu_ct <- mu[idx]
     propensity_ct <- propensity[idx]
-    factor_poisson <- mean(sqrt(mu_ct), na.rm = TRUE)
+    weight_ct <- weights[idx]
+    ok_w <- is.finite(weight_ct) & weight_ct > 0
+    if (!any(ok_w)) {
+      weight_ct <- rep.int(1, length(mu_ct))
+      ok_w <- rep(TRUE, length(mu_ct))
+    }
+    factor_poisson <- stats::weighted.mean(sqrt(mu_ct[ok_w]), w = weight_ct[ok_w], na.rm = TRUE)
     factor_nb <- if (is.finite(nb_size) && nb_size > 0) {
-      mean(mu_ct / sqrt(mu_ct + mu_ct^2 / nb_size), na.rm = TRUE)
+      stats::weighted.mean(
+        mu_ct[ok_w] / sqrt(mu_ct[ok_w] + mu_ct[ok_w]^2 / nb_size),
+        w = weight_ct[ok_w],
+        na.rm = TRUE
+      )
     } else {
       NA_real_
     }
     ans <- data.table::data.table(
       CellType = ct,
-      muhat_mean = mean(mu_ct, na.rm = TRUE),
+      muhat_mean = stats::weighted.mean(mu_ct[ok_w], w = weight_ct[ok_w], na.rm = TRUE),
       muhat_factor_poisson = factor_poisson,
       muhat_factor_nb = factor_nb,
       muhat_nb_size = nb_size,
-      muhat_propensity_mean = mean(propensity_ct, na.rm = TRUE)
+      muhat_propensity_mean = stats::weighted.mean(propensity_ct[ok_w], w = weight_ct[ok_w], na.rm = TRUE)
     )
     if (has_propensity) {
       ans$.muhat_mu <- list(mu_ct)
       ans$.muhat_propensity <- list(propensity_ct)
+      ans$.muhat_weight <- list(weight_ct)
     }
     ans
   })
@@ -1492,7 +1519,8 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     mu_hat_mat,
     cell_type,
     nb_size = NA_real_,
-    propensity = NULL) {
+    propensity = NULL,
+    weights = NULL) {
   mu_hat_mat <- as.matrix(mu_hat_mat)
   gene_names <- rownames(mu_hat_mat)
   if (is.null(gene_names)) {
@@ -1503,7 +1531,8 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
       mu = mu_hat_mat[i, ],
       cell_type = cell_type,
       nb_size = if (length(nb_size) >= i) nb_size[i] else nb_size[1],
-      propensity = propensity
+      propensity = propensity,
+      weights = weights
     )
     ans$gene <- gene_names[i]
     ans
@@ -1532,12 +1561,16 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   }
   has_counterfactual_inputs <- all(c(".muhat_mu", ".muhat_propensity") %in% names(result_df))
   if (has_counterfactual_inputs) {
+    if (!(".muhat_weight" %in% names(result_df))) {
+      result_df$.muhat_weight <- replicate(nrow(result_df), NULL, simplify = FALSE)
+    }
     result_df$estimate_logfc <- mapply(
       FUN = .dedml_logfc_from_counterfactual_residual,
       estimate = result_df$estimate,
       mu = result_df$.muhat_mu,
       propensity = result_df$.muhat_propensity,
       nb_size = result_df$muhat_nb_size,
+      weights = result_df$.muhat_weight,
       MoreArgs = list(outcome_distribution = outcome_distribution),
       SIMPLIFY = TRUE
     )
@@ -1551,6 +1584,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   result_df$muhat_factor_nb <- NULL
   result_df$.muhat_mu <- NULL
   result_df$.muhat_propensity <- NULL
+  result_df$.muhat_weight <- NULL
   result_df
 }
 
@@ -1908,6 +1942,308 @@ fit_residual_regression_pseudobulk_matrix <- function(
   as.data.frame(data.table::rbindlist(out, fill = TRUE))
 }
 
+.dedml_make_pseudobulk_outcome_data <- function(
+    counts,
+    meta,
+    outcome_confounders,
+    min_cells_per_sample_ct = 10L) {
+  df <- as.data.frame(meta, stringsAsFactors = FALSE)
+  df$.cell_index <- seq_len(nrow(df))
+  df$.unit_key <- paste(df$.sample_id, df$.CellType, sep = "\r")
+
+  sample_ct_counts <- dplyr::summarise(
+    dplyr::group_by(df, .unit_key, .sample_id, .CellType),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  )
+  valid_sample_ct <- dplyr::filter(sample_ct_counts, n_cells >= min_cells_per_sample_ct)
+  if (nrow(valid_sample_ct) == 0L) {
+    return(NULL)
+  }
+
+  keep_cell <- df$.unit_key %in% valid_sample_ct$.unit_key
+  df_keep <- df[keep_cell, , drop = FALSE]
+  if (nrow(df_keep) == 0L) {
+    return(NULL)
+  }
+
+  valid_sample_ct <- valid_sample_ct[match(unique(df_keep$.unit_key), valid_sample_ct$.unit_key), , drop = FALSE]
+  unit_index <- match(df_keep$.unit_key, valid_sample_ct$.unit_key)
+  first_idx <- match(valid_sample_ct$.unit_key, df_keep$.unit_key)
+
+  pb_df <- data.frame(
+    sample_id = valid_sample_ct$.sample_id,
+    CellType = as.character(valid_sample_ct$.CellType),
+    d_resid = df_keep$D_resid[first_idx],
+    donor_id = df_keep$.donor_id[first_idx],
+    fold = df_keep$fold[first_idx],
+    propensity_oof = df_keep$propensity_oof[first_idx],
+    n_cells = valid_sample_ct$n_cells,
+    .unit_key = valid_sample_ct$.unit_key,
+    stringsAsFactors = FALSE
+  )
+
+  covars <- unique(outcome_confounders)
+  covars <- covars[covars %in% colnames(df_keep)]
+  for (covar in covars) {
+    x <- df_keep[[covar]]
+    if (is.numeric(x) || is.integer(x)) {
+      vals <- rowsum(as.numeric(x), group = unit_index, reorder = FALSE)[, 1] / as.numeric(valid_sample_ct$n_cells)
+    } else {
+      vals <- vapply(seq_len(nrow(pb_df)), function(i) {
+        z <- x[unit_index == i]
+        z <- z[!is.na(z)]
+        if (length(z) == 0L) {
+          return(NA_character_)
+        }
+        as.character(z[1])
+      }, character(1L))
+      if (is.factor(x)) {
+        vals <- factor(vals, levels = levels(x))
+      }
+    }
+    pb_df[[covar]] <- vals
+  }
+  if ("CellType" %in% covars) {
+    pb_df$CellType <- as.character(pb_df$CellType)
+  }
+
+  cell_index <- df_keep$.cell_index
+  unit_n <- as.numeric(valid_sample_ct$n_cells)
+  if (requireNamespace("Matrix", quietly = TRUE)) {
+    agg <- Matrix::sparseMatrix(
+      i = unit_index,
+      j = seq_along(unit_index),
+      x = 1 / unit_n[unit_index],
+      dims = c(nrow(pb_df), length(unit_index))
+    )
+    y_pb_mat <- t(as.matrix(agg %*% t(counts[, cell_index, drop = FALSE])))
+  } else {
+    y_cell_gene <- t(as.matrix(counts[, cell_index, drop = FALSE]))
+    y_pb_mat <- t(rowsum(y_cell_gene, group = unit_index, reorder = FALSE) / unit_n)
+  }
+  rownames(y_pb_mat) <- rownames(counts)
+  colnames(y_pb_mat) <- pb_df$.unit_key
+
+  list(
+    pb_df = pb_df,
+    y_pb_mat = y_pb_mat,
+    x_pb = .build_design_matrix(pb_df, outcome_confounders)
+  )
+}
+
+.fit_predict_pseudobulk_outcome <- function(
+    x_train,
+    y_train,
+    x_test,
+    weights_train,
+    learner = c("lightgbm", "glm"),
+    distribution = c("poisson", "gaussian", "nb"),
+    params = list()) {
+  learner <- match.arg(learner)
+  distribution <- match.arg(distribution)
+  params$outcome_distribution <- NULL
+  params$.reuse_lgb_dataset <- NULL
+  params$.gc_after_fit <- NULL
+  weights_train <- suppressWarnings(as.numeric(weights_train))
+  weights_train[!is.finite(weights_train) | weights_train <= 0] <- 1
+
+  if (learner == "lightgbm") {
+    objective <- switch(
+      distribution,
+      gaussian = "regression",
+      poisson = "poisson",
+      nb = "negative_binomial_free"
+    )
+    return(.fit_predict_lightgbm(
+      x_train = x_train,
+      y_train = y_train,
+      x_test = x_test,
+      objective = objective,
+      params = params,
+      weight_train = weights_train
+    ))
+  }
+
+  x_train_i <- cbind("(Intercept)" = 1, x_train)
+  x_test_i <- cbind("(Intercept)" = 1, x_test)
+
+  if (distribution == "gaussian") {
+    fit <- suppressWarnings(stats::lm.wfit(x = x_train_i, y = as.numeric(y_train), w = weights_train))
+    beta <- fit$coefficients
+    beta[is.na(beta)] <- 0
+    pred <- as.numeric(x_test_i %*% beta)
+    pred <- pmax(pred, 1e-6)
+    attr(pred, "nb_size") <- NA_real_
+    return(pred)
+  }
+
+  if (distribution == "poisson") {
+    fit <- suppressWarnings(stats::glm.fit(
+      x = x_train_i,
+      y = as.numeric(y_train),
+      weights = weights_train,
+      family = stats::poisson()
+    ))
+    beta <- fit$coefficients
+    beta[is.na(beta)] <- 0
+    pred <- pmax(as.numeric(exp(x_test_i %*% beta)), 1e-6)
+    attr(pred, "nb_size") <- NA_real_
+    return(pred)
+  }
+
+  if (distribution == "nb") {
+    if (!requireNamespace("mgcv", quietly = TRUE)) {
+      stop("Package 'mgcv' is required for outcome_model='pseudobulk' and outcome_distribution='nb'.", call. = FALSE)
+    }
+    x_train_df <- as.data.frame(x_train, check.names = FALSE)
+    x_test_df <- as.data.frame(x_test, check.names = FALSE)
+    covar_names <- make.names(colnames(x_train_df), unique = TRUE)
+    colnames(x_train_df) <- covar_names
+    colnames(x_test_df) <- covar_names
+    train_df <- data.frame(.y = as.numeric(y_train), .w = weights_train, x_train_df, check.names = FALSE)
+    test_df <- data.frame(x_test_df, check.names = FALSE)
+    form <- if (length(covar_names) == 0L) {
+      stats::as.formula(".y ~ 1")
+    } else {
+      stats::as.formula(paste(".y ~", paste(covar_names, collapse = " + ")))
+    }
+    gam_args <- utils::modifyList(
+      list(formula = form, data = train_df, weights = train_df$.w, family = mgcv::nb(), method = "REML"),
+      params
+    )
+    fit <- suppressWarnings(do.call(mgcv::gam, gam_args))
+    pred <- pmax(as.numeric(stats::predict(fit, newdata = test_df, type = "response")), 1e-6)
+    attr(pred, "nb_size") <- tryCatch(as.numeric(fit$family$getTheta(TRUE)), error = function(e) NA_real_)
+    return(pred)
+  }
+
+  stop("Unsupported pseudo-bulk outcome distribution: ", distribution, call. = FALSE)
+}
+
+fit_residual_regression_pseudobulk_matrix_from_pb <- function(
+    y_resid_pb_mat,
+    pb_df,
+    gene_names = NULL,
+    min_samples = 3L,
+    cluster_robust = TRUE) {
+  if (is.null(dim(y_resid_pb_mat))) {
+    y_resid_pb_mat <- matrix(as.numeric(y_resid_pb_mat), nrow = 1L)
+  }
+  y_resid_pb_mat <- as.matrix(y_resid_pb_mat)
+  storage.mode(y_resid_pb_mat) <- "double"
+
+  if (ncol(y_resid_pb_mat) != nrow(pb_df)) {
+    stop("y_resid_pb_mat must have genes in rows and pseudo-bulk units in columns.", call. = FALSE)
+  }
+  if (is.null(gene_names)) {
+    gene_names <- rownames(y_resid_pb_mat)
+  }
+  if (is.null(gene_names)) {
+    gene_names <- paste0("gene_", seq_len(nrow(y_resid_pb_mat)))
+  }
+
+  pb_df <- as.data.frame(pb_df, stringsAsFactors = FALSE)
+  pb_df$CellType <- factor(as.character(pb_df$CellType))
+  sample_counts_by_ct <- dplyr::summarise(
+    dplyr::group_by(pb_df, CellType),
+    n_samples = dplyr::n(),
+    .groups = "drop"
+  )
+  keep_ct <- as.character(sample_counts_by_ct$CellType[sample_counts_by_ct$n_samples >= min_samples])
+  keep_unit <- as.character(pb_df$CellType) %in% keep_ct
+  pb_df <- pb_df[keep_unit, , drop = FALSE]
+  y_resid_pb_mat <- y_resid_pb_mat[, keep_unit, drop = FALSE]
+  if (nrow(pb_df) == 0L || length(unique(pb_df$d_resid)) < 2L) {
+    return(NULL)
+  }
+
+  finite_gene <- rowSums(!is.finite(y_resid_pb_mat)) == 0L
+  if (!any(finite_gene)) {
+    return(NULL)
+  }
+  y <- t(y_resid_pb_mat[finite_gene, , drop = FALSE])
+  batch_gene_names <- gene_names[finite_gene]
+
+  pb_df$CellType <- droplevels(pb_df$CellType)
+  x <- stats::model.matrix(~ d_resid * CellType, data = pb_df)
+  w <- as.numeric(pb_df$n_cells)
+  fit <- stats::lm.wfit(x = x, y = y, w = w)
+  if (fit$rank < ncol(x)) {
+    return(NULL)
+  }
+  coef_mat <- fit$coefficients
+  if (is.null(dim(coef_mat))) {
+    coef_mat <- matrix(coef_mat, ncol = 1L)
+  }
+  colnames(coef_mat) <- batch_gene_names
+
+  a_inv <- chol2inv(qr.R(fit$qr))
+  rownames(a_inv) <- colnames(a_inv) <- colnames(x)
+
+  ct_levels <- levels(pb_df$CellType)
+  nd_1 <- data.frame(d_resid = rep(1, length(ct_levels)), CellType = factor(ct_levels, levels = ct_levels))
+  nd_0 <- data.frame(d_resid = rep(0, length(ct_levels)), CellType = factor(ct_levels, levels = ct_levels))
+  contrast <- stats::model.matrix(~ d_resid * CellType, data = nd_1) -
+    stats::model.matrix(~ d_resid * CellType, data = nd_0)
+  colnames(contrast) <- colnames(x)
+
+  est_mat <- contrast %*% coef_mat
+  repeated_donor_samples <- any(table(pb_df$donor_id) > 1L)
+  n_unique_donors <- length(unique(pb_df$donor_id))
+  use_cluster <- isTRUE(cluster_robust) && repeated_donor_samples && n_unique_donors >= 2L
+  if (use_cluster) {
+    b_mat <- contrast %*% a_inv
+    var_mat <- matrix(0, nrow = nrow(contrast), ncol = ncol(y))
+    donor_levels <- unique(pb_df$donor_id)
+    wx <- x * w
+    for (donor in donor_levels) {
+      idx <- which(pb_df$donor_id == donor)
+      score_d <- crossprod(wx[idx, , drop = FALSE], fit$residuals[idx, , drop = FALSE])
+      z_d <- b_mat %*% score_d
+      var_mat <- var_mat + z_d^2
+    }
+    n_obs <- nrow(x)
+    n_coef <- ncol(x)
+    df_correction <- (n_unique_donors / (n_unique_donors - 1L)) * ((n_obs - 1L) / (n_obs - n_coef))
+    var_mat <- df_correction * var_mat
+    se_method <- "donor_cluster_robust"
+  } else {
+    sigma2 <- colSums(w * fit$residuals^2) / fit$df.residual
+    contrast_var <- diag(contrast %*% a_inv %*% t(contrast))
+    var_mat <- outer(contrast_var, sigma2)
+    se_method <- "model_based"
+  }
+
+  std_error <- sqrt(pmax(var_mat, 0))
+  statistic <- est_mat / std_error
+  p_value <- 2 * stats::pnorm(-abs(statistic))
+
+  ct_summary <- dplyr::summarise(
+    dplyr::group_by(pb_df, CellType),
+    n_pseudobulk = dplyr::n(),
+    n_cells = sum(n_cells),
+    n_samples = dplyr::n_distinct(sample_id),
+    n_donors = dplyr::n_distinct(donor_id),
+    .groups = "drop"
+  )
+
+  out <- do.call(rbind, lapply(seq_along(batch_gene_names), function(j) {
+    data.frame(
+      CellType = ct_levels,
+      estimate = as.numeric(est_mat[, j]),
+      std_error = as.numeric(std_error[, j]),
+      statistic = as.numeric(statistic[, j]),
+      p_value = as.numeric(p_value[, j]),
+      se_method = se_method,
+      repeated_donor_samples = repeated_donor_samples,
+      gene = batch_gene_names[j],
+      stringsAsFactors = FALSE
+    )
+  }))
+  as.data.frame(dplyr::left_join(out, ct_summary, by = "CellType"))
+}
+
 .finalize_dedml_output <- function(
     result_list,
     error_list,
@@ -2019,7 +2355,12 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' Fit DEDML on Cell-Level Data
 #'
 #' Runs donor-blocked cross-fitted DEDML with configurable confounders,
-#' treatment learner, and outcome learner.
+#' treatment learner, outcome model level, and outcome learner. With
+#' `outcome_model = "cell"`, the outcome learner estimates nuisance means per
+#' cell before the final pseudo-bulk residual regression. With
+#' `outcome_model = "pseudobulk"`, the outcome learner estimates nuisance means
+#' directly on sample-celltype pseudo-bulk means with cell-count weights, then
+#' runs the final residual regression on those same pseudo-bulk units.
 #'
 #' @param counts Gene-by-cell count matrix (rows are genes, columns are cells).
 #' @param meta Cell metadata data.frame.
@@ -2037,12 +2378,18 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @param n_folds Number of donor folds.
 #' @param n_cores Number of cores for gene-level parallelization.
 #' @param donor_model Donor treatment model (`"glm"` or `"lightgbm"`).
-#' @param outcome_model Outcome model (`"lightgbm"` or `"glm"`).
+#' @param outcome_model Outcome nuisance model level (`"cell"` or
+#' `"pseudobulk"`). Legacy values `"lightgbm"` and `"glm"` are accepted and
+#' interpreted as `outcome_model = "cell"` with the corresponding
+#' `outcome_learner`.
+#' @param outcome_learner Outcome learner (`"lightgbm"` or `"glm"`). For
+#' `outcome_model = "pseudobulk"`, LightGBM is fit to pseudo-bulk means with
+#' cell-count weights, while `"glm"` uses weighted GLM/GAM fits.
 #' @param outcome_distribution Outcome likelihood/working distribution:
 #' `"poisson"` by default, with `"gaussian"` and `"nb"` also available.
-#' For `outcome_model = "glm"`, Poisson and Gaussian use `stats::glm.fit()`
+#' For `outcome_learner = "glm"`, Poisson and Gaussian use `stats::glm.fit()`
 #' and NB uses `mgcv::gam()`
-#' with `mgcv::nb()`. For `outcome_model = "lightgbm"`, these map to
+#' with `mgcv::nb()`. For `outcome_learner = "lightgbm"`, these map to
 #' LightGBM L2 regression, Poisson, and free-dispersion NB objectives.
 #' Gaussian/L2 changes only the nuisance mean learner; its final residual
 #' conversion still uses Poisson variance.
@@ -2050,7 +2397,8 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @param outcome_params Optional outcome learner hyperparameters. The
 #' outcome objective/family is controlled by `outcome_distribution`, so
 #' redundant `objective`, `metric`, and `family` entries are ignored. For
-#' `outcome_model = "glm"` and `outcome_distribution = "poisson"`,
+#' `outcome_model = "cell"`, `outcome_learner = "glm"`, and
+#' `outcome_distribution = "poisson"`,
 #' `batched_irls = TRUE` enables an exact shared-design IRLS implementation;
 #' it uses `n_cores` and `parallel_backend` to split genes into independent
 #' blocks. It is opt-in because the regular parallel scalar `glm.fit()` path can
@@ -2076,7 +2424,7 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @param cell_type_col Deprecated alias for `cell_type`.
 #' @param focus_celltypes Deprecated alias for `cell_types`.
 #' @param treatment_learner Deprecated alias for `donor_model`.
-#' @param outcome_learner Deprecated alias for `outcome_model`.
+#' @param outcome_learner Outcome nuisance learner (`"lightgbm"` or `"glm"`).
 #'
 #' @return A list with `results`, `donor_meta`, `settings`, `diagnostics`,
 #' and `errors`.
@@ -2109,7 +2457,8 @@ dedml_fit <- function(
     n_folds = 3L,
     n_cores = 1L,
     donor_model = "glm",
-    outcome_model = "lightgbm",
+    outcome_model = c("cell", "pseudobulk"),
+    outcome_learner = c("lightgbm", "glm"),
     outcome_distribution = c("poisson", "gaussian", "nb"),
     treatment_params = list(),
     outcome_params = list(),
@@ -2128,8 +2477,7 @@ dedml_fit <- function(
     treatment_col = NULL,
     cell_type_col = NULL,
     focus_celltypes = NULL,
-    treatment_learner = NULL,
-    outcome_learner = NULL) {
+    treatment_learner = NULL) {
   outcome_distribution <- match.arg(outcome_distribution)
   pvalue_calibration <- match.arg(pvalue_calibration)
   parallel_backend <- match.arg(parallel_backend)
@@ -2163,7 +2511,26 @@ dedml_fit <- function(
   if (!is.null(cell_type_col)) cell_type <- cell_type_col
   if (!is.null(focus_celltypes)) cell_types <- focus_celltypes
   if (!is.null(treatment_learner)) donor_model <- treatment_learner
-  if (!is.null(outcome_learner)) outcome_model <- outcome_learner
+  donor_model <- match.arg(donor_model, c("glm", "lightgbm"))
+
+  if (length(outcome_model) > 1L) {
+    outcome_model <- outcome_model[[1L]]
+  }
+  if (length(outcome_learner) > 1L) {
+    outcome_learner <- outcome_learner[[1L]]
+  }
+  if (outcome_model %in% c("lightgbm", "glm")) {
+    if (isTRUE(verbose)) {
+      message(
+        "Interpreting legacy outcome_model='", outcome_model,
+        "' as outcome_model='cell', outcome_learner='", outcome_model, "'."
+      )
+    }
+    outcome_learner <- outcome_model
+    outcome_model <- "cell"
+  }
+  outcome_model <- match.arg(outcome_model, c("cell", "pseudobulk"))
+  outcome_learner <- match.arg(outcome_learner, c("lightgbm", "glm"))
 
   outcome_redundant <- intersect(names(outcome_params), c("objective", "metric", "family"))
   if (length(outcome_redundant) > 0L) {
@@ -2177,10 +2544,12 @@ dedml_fit <- function(
   }
   outcome_batched_irls <- isTRUE(outcome_params$batched_irls)
   outcome_params$batched_irls <- NULL
-  if (isTRUE(outcome_batched_irls) && outcome_distribution == "nb" && isTRUE(verbose)) {
+  if (isTRUE(outcome_batched_irls) &&
+      !(outcome_model == "cell" && outcome_learner == "glm" && outcome_distribution == "poisson") &&
+      isTRUE(verbose)) {
     message(
-      "Ignoring outcome_params$batched_irls for outcome_distribution='nb'; ",
-      "exact free-theta NB remains scalar mgcv::gam per gene."
+      "Ignoring outcome_params$batched_irls; it is only used for ",
+      "outcome_model='cell', outcome_learner='glm', outcome_distribution='poisson'."
     )
     outcome_batched_irls <- FALSE
   }
@@ -2342,7 +2711,7 @@ dedml_fit <- function(
     by = ".donor_id"
   )
 
-  if (donor_model == "lightgbm" && outcome_model == "lightgbm" && n_cores > 1L &&
+  if (donor_model == "lightgbm" && outcome_learner == "lightgbm" && n_cores > 1L &&
       "lightgbm" %in% loadedNamespaces()) {
     gc()
     try(unloadNamespace("lightgbm"), silent = TRUE)
@@ -2367,7 +2736,7 @@ dedml_fit <- function(
       x_test = x_outcome[test_idx, , drop = FALSE]
     )
   })
-  if (outcome_model == "glm" && outcome_distribution == "nb") {
+  if (outcome_model == "cell" && outcome_learner == "glm" && outcome_distribution == "nb") {
     fold_plan <- lapply(fold_plan, function(fold) {
       x_train_df <- as.data.frame(fold$x_train, check.names = FALSE)
       x_test_df <- as.data.frame(fold$x_test, check.names = FALSE)
@@ -2400,7 +2769,7 @@ dedml_fit <- function(
         x_train = fold$x_train,
         y_train = y_obs[fold$train_idx],
         x_test = fold$x_test,
-        learner = outcome_model,
+        learner = outcome_learner,
         params = if (!is.null(fold$params)) {
           fold$params
         } else if (!is.null(fold$nb_params)) {
@@ -2511,7 +2880,187 @@ dedml_fit <- function(
     ceiling(seq_along(gene_names) / gene_chunk_size)
   )
 
-  if (outcome_model == "glm" && outcome_distribution == "gaussian") {
+  if (outcome_model == "pseudobulk") {
+    if (isTRUE(verbose)) {
+      message("Using pseudo-bulk outcome nuisance fit")
+    }
+    pb_data <- .dedml_make_pseudobulk_outcome_data(
+      counts = counts,
+      meta = meta,
+      outcome_confounders = outcome_confounders,
+      min_cells_per_sample_ct = min_cells_per_sample_ct
+    )
+    if (is.null(pb_data)) {
+      stop("No valid pseudo-bulk units are available for outcome_model='pseudobulk'.", call. = FALSE)
+    }
+    pb_df <- pb_data$pb_df
+    y_pb_mat <- pb_data$y_pb_mat
+    x_pb <- pb_data$x_pb
+    pb_fold_plan <- lapply(seq_len(n_folds), function(k) {
+      train_idx <- which(pb_df$fold != k)
+      test_idx <- which(pb_df$fold == k)
+      list(
+        train_idx = train_idx,
+        test_idx = test_idx,
+        x_train = x_pb[train_idx, , drop = FALSE],
+        x_test = x_pb[test_idx, , drop = FALSE],
+        w_train = pb_df$n_cells[train_idx]
+      )
+    })
+
+    run_pseudobulk_block <- function(indices) {
+      tryCatch({
+        block_gene_names <- gene_names[indices]
+        mu_hat_mat <- matrix(NA_real_, nrow = length(indices), ncol = ncol(y_pb_mat))
+        y_resid_pb_mat <- matrix(NA_real_, nrow = length(indices), ncol = ncol(y_pb_mat))
+        rownames(mu_hat_mat) <- block_gene_names
+        rownames(y_resid_pb_mat) <- block_gene_names
+        nb_size_vec <- rep(NA_real_, length(indices))
+
+        for (j in seq_along(indices)) {
+          g_idx <- indices[j]
+          y_obs <- as.numeric(y_pb_mat[g_idx, ])
+          nb_sizes <- numeric(0)
+          for (fold in pb_fold_plan) {
+            fold_pred <- .fit_predict_pseudobulk_outcome(
+              x_train = fold$x_train,
+              y_train = y_obs[fold$train_idx],
+              x_test = fold$x_test,
+              weights_train = fold$w_train,
+              learner = outcome_learner,
+              distribution = outcome_distribution,
+              params = outcome_params
+            )
+            mu_hat_mat[j, fold$test_idx] <- fold_pred
+            nb_sizes <- c(nb_sizes, attr(fold_pred, "nb_size"))
+          }
+          nb_size <- stats::median(nb_sizes[is.finite(nb_sizes) & nb_sizes > 0], na.rm = TRUE)
+          if (!is.finite(nb_size)) {
+            nb_size <- NA_real_
+          }
+          y_resid <- .compute_outcome_residual(
+            y = y_obs,
+            mu = mu_hat_mat[j, ],
+            cell_type = pb_df$CellType,
+            outcome_distribution = outcome_distribution,
+            nb_size = nb_size,
+            nb_size_min = nb_size_min,
+            nb_size_max = nb_size_max
+          )
+          y_resid_pb_mat[j, ] <- y_resid
+          nb_size_vec[j] <- attr(y_resid, "nb_size")
+        }
+
+        rr <- fit_residual_regression_pseudobulk_matrix_from_pb(
+          y_resid_pb_mat = y_resid_pb_mat,
+          pb_df = pb_df,
+          gene_names = block_gene_names,
+          min_samples = min_samples_per_celltype,
+          cluster_robust = TRUE
+        )
+        if (is.null(rr) || nrow(rr) == 0L) {
+          return(NULL)
+        }
+        nb_size_df <- data.frame(gene = block_gene_names, nb_size = nb_size_vec, stringsAsFactors = FALSE)
+        rr <- dplyr::left_join(rr, nb_size_df, by = "gene")
+        mu_factor_df <- .summarise_oof_mu_factors_matrix(
+          mu_hat_mat = mu_hat_mat,
+          cell_type = pb_df$CellType,
+          nb_size = nb_size_vec,
+          propensity = pb_df$propensity_oof,
+          weights = pb_df$n_cells
+        )
+        .append_logfc_effect_sizes(rr, mu_factor_df, outcome_distribution = outcome_distribution)
+      }, error = function(e) {
+        list(.error = TRUE, gene = paste(gene_names[indices], collapse = ","), message = conditionMessage(e))
+      })
+    }
+
+    helper_names <- c(
+      ".fit_predict_pseudobulk_outcome", ".fit_predict_lightgbm", ".compute_outcome_residual",
+      ".summarise_oof_mu_factors", ".summarise_oof_mu_factors_matrix",
+      ".dedml_logfc_from_residual", ".dedml_logfc_from_counterfactual_residual",
+      ".append_logfc_effect_sizes", "fit_residual_regression_pseudobulk_matrix_from_pb"
+    )
+    helper_env <- environment(.fit_predict_pseudobulk_outcome)
+    for (nm in helper_names[helper_names %in% ls(envir = helper_env, all.names = TRUE)]) {
+      obj <- get(nm, envir = helper_env)
+      if (is.function(obj)) {
+        environment(obj) <- environment(run_pseudobulk_block)
+      }
+      assign(nm, obj, envir = environment(run_pseudobulk_block))
+    }
+
+    if (n_cores > 1L) {
+      if (parallel_backend == "psock") {
+        cl <- .dedml_make_psock_cluster(n_cores)
+        if (inherits(cl, "error")) {
+          if (isTRUE(verbose)) {
+            message("PSOCK backend failed (", conditionMessage(cl), "); running pseudo-bulk outcome serially.")
+          }
+          raw_result_chunks <- lapply(gene_chunks, run_pseudobulk_block)
+        } else {
+          on.exit(parallel::stopCluster(cl), add = TRUE)
+          psock_env <- new.env(parent = emptyenv())
+          psock_env$.DEDML_PSOCK_STATE <- list(run_gene_block = run_pseudobulk_block)
+          psock_env$.dedml_psock_eval_block <- .dedml_psock_eval_block
+          parallel::clusterExport(
+            cl,
+            varlist = c(".DEDML_PSOCK_STATE", ".dedml_psock_eval_block"),
+            envir = psock_env
+          )
+          raw_result_chunks <- parallel::parLapply(cl, gene_chunks, .dedml_psock_eval_block)
+          parallel::clusterEvalQ(cl, rm(.DEDML_PSOCK_STATE, .dedml_psock_eval_block, envir = .GlobalEnv))
+        }
+      } else {
+        raw_result_chunks <- parallel::mclapply(gene_chunks, run_pseudobulk_block, mc.cores = n_cores)
+      }
+    } else {
+      raw_result_chunks <- lapply(gene_chunks, run_pseudobulk_block)
+    }
+
+    error_list <- Filter(function(x) is.list(x) && !is.data.frame(x) && isTRUE(x$.error), raw_result_chunks)
+    result_chunks <- Filter(function(x) is.data.frame(x) && nrow(x) > 0L, raw_result_chunks)
+    settings <- list(
+      donor_id = donor_res$source,
+      sample_id = sample_res$source,
+      treatment = treatment_res$source,
+      cell_type = celltype_res$source,
+      treatment_confounders = treatment_confounders,
+      treatment_cell_summaries = treatment_cell_summaries,
+      outcome_confounders = outcome_confounders,
+      n_folds = n_folds,
+      donor_model = donor_model,
+      outcome_model = outcome_model,
+      outcome_learner = outcome_learner,
+      outcome_distribution = outcome_distribution,
+      nb_size_min = nb_size_min,
+      nb_size_max = nb_size_max,
+      pvalue_calibration = pvalue_calibration,
+      calibration_quantile = calibration_quantile,
+      outcome_batched_irls = outcome_batched_irls,
+      requested_parallel_backend = requested_parallel_backend,
+      parallel_backend = parallel_backend,
+      gene_chunk_size = gene_chunk_size,
+      n_gene_chunks = length(gene_chunks),
+      outcome_fast_path = "pseudobulk_outcome_nuisance",
+      residual_regression_memory = "pseudobulk",
+      min_cells_per_sample_ct = min_cells_per_sample_ct,
+      min_samples_per_celltype = min_samples_per_celltype,
+      seed = seed
+    )
+    return(.finalize_dedml_output(
+      result_list = result_chunks,
+      error_list = error_list,
+      donor_meta = donor_meta,
+      settings = settings,
+      diagnostics = diagnostics,
+      pvalue_calibration = pvalue_calibration,
+      calibration_quantile = calibration_quantile
+    ))
+  }
+
+  if (outcome_model == "cell" && outcome_learner == "glm" && outcome_distribution == "gaussian") {
     if (isTRUE(verbose)) {
       message("Using batched Gaussian GLM outcome fit")
     }
@@ -2572,6 +3121,7 @@ dedml_fit <- function(
       n_folds = n_folds,
       donor_model = donor_model,
       outcome_model = outcome_model,
+      outcome_learner = outcome_learner,
       outcome_distribution = outcome_distribution,
       nb_size_min = nb_size_min,
       nb_size_max = nb_size_max,
@@ -2599,7 +3149,7 @@ dedml_fit <- function(
     ))
   }
 
-  if (outcome_model == "glm" && outcome_distribution == "poisson" && isTRUE(outcome_batched_irls)) {
+  if (outcome_model == "cell" && outcome_learner == "glm" && outcome_distribution == "poisson" && isTRUE(outcome_batched_irls)) {
     if (isTRUE(verbose)) {
       message("Using batched Poisson GLM outcome IRLS")
     }
@@ -2744,6 +3294,7 @@ dedml_fit <- function(
       n_folds = n_folds,
       donor_model = donor_model,
       outcome_model = outcome_model,
+      outcome_learner = outcome_learner,
       outcome_distribution = outcome_distribution,
       nb_size_min = nb_size_min,
       nb_size_max = nb_size_max,
@@ -2780,7 +3331,7 @@ dedml_fit <- function(
 
   run_gene_block <- function(indices) {
     block_fold_plan <- fold_plan
-    if (outcome_model == "lightgbm" && !isFALSE(outcome_params$.reuse_lgb_dataset)) {
+    if (outcome_model == "cell" && outcome_learner == "lightgbm" && !isFALSE(outcome_params$.reuse_lgb_dataset)) {
       block_fold_plan <- .add_lgb_datasets_to_fold_plan(fold_plan, outcome_params)
       on.exit({
         .finalize_lgb_datasets_in_fold_plan(block_fold_plan)
@@ -2882,6 +3433,7 @@ dedml_fit <- function(
     n_folds = n_folds,
     donor_model = donor_model,
     outcome_model = outcome_model,
+    outcome_learner = outcome_learner,
     outcome_distribution = outcome_distribution,
     nb_size_min = nb_size_min,
     nb_size_max = nb_size_max,

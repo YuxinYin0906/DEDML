@@ -18,7 +18,8 @@ dedml_fit(
   n_folds = 3L,
   n_cores = 1L,
   donor_model = "glm",
-  outcome_model = "lightgbm",
+  outcome_model = c("cell", "pseudobulk"),
+  outcome_learner = c("lightgbm", "glm"),
   outcome_distribution = c("poisson", "gaussian", "nb"),
   treatment_params = list(),
   outcome_params = list(),
@@ -37,8 +38,7 @@ dedml_fit(
   treatment_col = NULL,
   cell_type_col = NULL,
   focus_celltypes = NULL,
-  treatment_learner = NULL,
-  outcome_learner = NULL
+  treatment_learner = NULL
 )
 }
 \arguments{
@@ -57,12 +57,17 @@ dedml_fit(
 \item{n_folds}{Number of donor-level cross-fitting folds.}
 \item{n_cores}{Number of CPU cores for gene-level parallelization.}
 \item{donor_model}{Donor treatment model: \code{"glm"} or \code{"lightgbm"}.}
-\item{outcome_model}{Outcome model: \code{"lightgbm"} or \code{"glm"}.}
+\item{outcome_model}{Outcome nuisance model level: \code{"cell"} or
+\code{"pseudobulk"}. Legacy values \code{"lightgbm"} and \code{"glm"} are
+accepted and interpreted as \code{outcome_model = "cell"} with the
+corresponding \code{outcome_learner}.}
+\item{outcome_learner}{Outcome nuisance learner: \code{"lightgbm"} or
+\code{"glm"}.}
 \item{outcome_distribution}{Outcome likelihood/working distribution:
 \code{"poisson"} by default, with \code{"gaussian"} and \code{"nb"} also
-available. For \code{outcome_model = "glm"}, Poisson and Gaussian use \code{stats::glm.fit()}
+available. For \code{outcome_learner = "glm"}, Poisson and Gaussian use \code{stats::glm.fit()}
 and NB uses \code{mgcv::gam()} with \code{mgcv::nb()}. For
-\code{outcome_model = "lightgbm"}, these map to LightGBM L2 regression,
+\code{outcome_learner = "lightgbm"}, these map to LightGBM L2 regression,
 Poisson, and free-dispersion NB objectives. Gaussian/L2 changes only the
 nuisance mean learner; its final residual conversion still uses Poisson
 variance.}
@@ -70,7 +75,8 @@ variance.}
 \item{outcome_params}{Optional outcome learner hyperparameters. The outcome
 objective/family is controlled by \code{outcome_distribution}, so redundant
 \code{objective}, \code{metric}, and \code{family} entries are ignored. For
-\code{outcome_model = "glm"} and \code{outcome_distribution = "poisson"},
+\code{outcome_model = "cell"}, \code{outcome_learner = "glm"}, and
+\code{outcome_distribution = "poisson"},
 \code{batched_irls = TRUE} enables an exact shared-design IRLS implementation;
 it uses \code{n_cores} and \code{parallel_backend} to split genes into
 independent blocks. It is opt-in because the regular parallel scalar
@@ -98,7 +104,6 @@ genes materialized together for batched residual regression.}
 \item{cell_type_col}{Deprecated alias for \code{cell_type}.}
 \item{focus_celltypes}{Deprecated alias for \code{cell_types}.}
 \item{treatment_learner}{Deprecated alias for \code{donor_model}.}
-\item{outcome_learner}{Deprecated alias for \code{outcome_model}.}
 }
 \value{
 A list with \code{results}, \code{donor_meta}, \code{settings},
@@ -118,4 +123,10 @@ one treatment group, stop the fit before model training.
 \description{
 Run donor-blocked cross-fitted double machine learning with configurable
 confounders, selectable cell types, model choices, and parallel cores.
+\code{outcome_model} controls whether the nuisance outcome model is fit at the
+cell level or sample-celltype pseudo-bulk level. \code{outcome_learner}
+controls whether that level is fit with LightGBM or GLM/GAM. With
+\code{outcome_model = "pseudobulk"}, pseudo-bulk means are fit with cell-count
+weights, then the final residual regression is run on those same pseudo-bulk
+units.
 }
