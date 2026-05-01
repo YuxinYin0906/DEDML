@@ -59,8 +59,8 @@ dedml_fit(
 \item{donor_model}{Donor treatment model: \code{"glm"} or \code{"lightgbm"}.}
 \item{outcome_model}{Outcome model: \code{"lightgbm"} or \code{"glm"}.}
 \item{outcome_distribution}{Outcome likelihood/working distribution:
-\code{"gaussian"}, \code{"poisson"}, or \code{"nb"}. For
-\code{outcome_model = "glm"}, Gaussian and Poisson use \code{stats::glm.fit()}
+\code{"poisson"} by default, with \code{"gaussian"} and \code{"nb"} also
+available. For \code{outcome_model = "glm"}, Poisson and Gaussian use \code{stats::glm.fit()}
 and NB uses \code{mgcv::gam()} with \code{mgcv::nb()}. For
 \code{outcome_model = "lightgbm"}, these map to LightGBM L2 regression,
 Poisson, and free-dispersion NB objectives. Gaussian/L2 changes only the
@@ -101,14 +101,19 @@ genes materialized together for batched residual regression.}
 \item{outcome_learner}{Deprecated alias for \code{outcome_model}.}
 }
 \value{
-A list with \code{results}, \code{donor_meta}, \code{settings}, and \code{errors}.
+A list with \code{results}, \code{donor_meta}, \code{settings},
+\code{diagnostics}, and \code{errors}.
 The \code{results} table reports the residual-scale DEDML effect in
 \code{estimate}. It also includes \code{estimate_logfc}, a practical post-hoc
 log fold-change effect size targeting the untreated-baseline mean. The
 conversion uses the out-of-fold nuisance mean and treatment propensity:
 \code{"gaussian"} and \code{"poisson"} use the Poisson residual scale, while
 \code{"nb"} uses the negative-binomial residual scale. DEDML inference uses the
-residual-scale statistic and p-value.
+residual-scale statistic and p-value. The \code{diagnostics} table records
+design and treatment model issues such as weak fold overlap, numeric
+non-overlap, and degenerate propensity estimates. Fatal design diagnostics,
+including separated categorical batch/site/confounder levels observed in only
+one treatment group, stop the fit before model training.
 }
 \description{
 Run donor-blocked cross-fitted double machine learning with configurable

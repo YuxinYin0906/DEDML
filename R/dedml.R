@@ -6,6 +6,13 @@ available_dedml_learners <- function() {
   )
 }
 
+if (getRversion() >= "2.15.1") {
+  utils::globalVariables(c(
+    ".CellType", ".DEDML_POISSON_IRLS_STATE", ".DEDML_PSOCK_STATE",
+    ".sample_id", "fold", "level", "tail_lambda", "variable"
+  ))
+}
+
 #' Build a Confounder Specification for DEDML
 #'
 #' Helper to define donor-level and cell-level confounders once, then pass
@@ -81,6 +88,183 @@ dedml_validate_confounder_spec <- function(meta, confounder_spec) {
   invisible(TRUE)
 }
 
+.dedml_default_empty_diagnostics <- function() {
+  data.frame(
+    severity = character(),
+    stage = character(),
+    check = character(),
+    message = character(),
+    recommendation = character(),
+    stringsAsFactors = FALSE
+  )
+}
+
+.dedml_format_diagnostic_bullets <- function(diagnostics, max_items = 8L) {
+  if (!is.data.frame(diagnostics) || nrow(diagnostics) == 0L) {
+    return(character())
+  }
+  show_df <- utils::head(diagnostics, max_items)
+  bullets <- paste0(
+    "- [", show_df$stage, "/", show_df$check, "] ",
+    show_df$message,
+    " Recommendation: ", show_df$recommendation
+  )
+  if (nrow(diagnostics) > nrow(show_df)) {
+    bullets <- c(
+      bullets,
+      paste0("- ... ", nrow(diagnostics) - nrow(show_df), " more issue(s).")
+    )
+  }
+  bullets
+}
+
+.dedml_stop_for_fatal_diagnostics <- function(diagnostics) {
+  if (!is.data.frame(diagnostics) || nrow(diagnostics) == 0L) {
+    return(invisible(FALSE))
+  }
+  fatal_diagnostics <- diagnostics[diagnostics$severity == "error", , drop = FALSE]
+  if (nrow(fatal_diagnostics) == 0L) {
+    return(invisible(FALSE))
+  }
+  stop(
+    paste0(
+      "DEDML cannot continue because fatal design diagnostics were detected:\n",
+      paste(.dedml_format_diagnostic_bullets(fatal_diagnostics), collapse = "\n"),
+      "\nRun dedml_summarize_design(..., stop_on_error = FALSE) to inspect the full design report."
+    ),
+    call. = FALSE
+  )
+}
+
+.dedml_prepare_design_metadata <- function(
+    meta,
+    donor_id,
+    sample_id,
+    treatment,
+    cell_type,
+    confounder_spec,
+    treatment_confounders,
+    treatment_cell_summaries,
+    outcome_confounders,
+    cell_types = NULL,
+    drop_missing = TRUE) {
+  meta <- as.data.frame(meta, stringsAsFactors = FALSE)
+  if (is.null(sample_id)) {
+    sample_id <- donor_id
+  }
+
+  donor_res <- .resolve_input_column(meta, donor_id, "donor_id")
+  sample_res <- .resolve_input_column(meta, sample_id, "sample_id")
+  treatment_res <- .resolve_input_column(meta, treatment, "treatment")
+  celltype_res <- .resolve_input_column(meta, cell_type, "cell_type")
+
+  meta$.donor_id <- as.character(donor_res$values)
+  meta$.sample_id <- as.character(sample_res$values)
+  meta$.D <- as.integer(treatment_res$values)
+  meta$.CellType <- as.character(celltype_res$values)
+
+  if (!all(meta$.D %in% c(0L, 1L, NA_integer_))) {
+    stop("Treatment column must be coded as 0/1.", call. = FALSE)
+  }
+
+  if (!is.null(confounder_spec)) {
+    dedml_validate_confounder_spec(meta = meta, confounder_spec = confounder_spec)
+    treatment_confounders <- confounder_spec$treatment_confounders
+    treatment_cell_summaries <- confounder_spec$treatment_cell_summaries
+    outcome_confounders <- confounder_spec$outcome_confounders
+  }
+
+  if (!is.null(cell_types)) {
+    meta <- meta[meta$.CellType %in% cell_types, , drop = FALSE]
+  }
+
+  needed_cols <- unique(c(
+    treatment_confounders,
+    treatment_cell_summaries,
+    outcome_confounders
+  ))
+  needed_cols <- setdiff(needed_cols, c("", NA))
+
+  missing_needed <- setdiff(needed_cols, colnames(meta))
+  if (length(missing_needed) > 0L) {
+    stop("Missing confounder columns in meta: ", paste(missing_needed, collapse = ", "), call. = FALSE)
+  }
+
+  if (isTRUE(drop_missing) && length(needed_cols) > 0L) {
+    keep_complete <- stats::complete.cases(meta[, needed_cols, drop = FALSE])
+    meta <- meta[keep_complete, , drop = FALSE]
+  }
+
+  if (nrow(meta) == 0L) {
+    stop("No metadata rows available after filtering and complete-case selection.", call. = FALSE)
+  }
+
+  donor_consistency <- tapply(meta$.D, meta$.donor_id, function(x) length(unique(x)))
+  if (any(donor_consistency != 1L)) {
+    bad <- names(donor_consistency)[donor_consistency != 1L]
+    stop("Treatment must be constant within donor. Violations: ", paste(utils::head(bad, 10), collapse = ", "), call. = FALSE)
+  }
+
+  list(
+    meta = meta,
+    treatment_confounders = treatment_confounders,
+    treatment_cell_summaries = treatment_cell_summaries,
+    outcome_confounders = outcome_confounders,
+    needed_cols = needed_cols
+  )
+}
+
+.dedml_build_donor_design <- function(
+    meta,
+    treatment_confounders,
+    treatment_cell_summaries,
+    n_folds,
+    seed) {
+  if (length(treatment_confounders) > 0L) {
+    donor_meta <- dplyr::summarise(
+      dplyr::group_by(meta, .donor_id),
+      .D = .D[1],
+      dplyr::across(dplyr::all_of(treatment_confounders), ~ .x[1]),
+      .groups = "drop"
+    )
+  } else {
+    donor_meta <- dplyr::summarise(
+      dplyr::group_by(meta, .donor_id),
+      .D = .D[1],
+      .groups = "drop"
+    )
+  }
+
+  if (length(treatment_cell_summaries) > 0L) {
+    donor_summ <- dplyr::summarise(
+      dplyr::group_by(meta, .donor_id),
+      dplyr::across(dplyr::all_of(treatment_cell_summaries), ~ mean(as.numeric(.x), na.rm = TRUE), .names = "mean_{.col}"),
+      .groups = "drop"
+    )
+    donor_meta <- dplyr::left_join(donor_meta, donor_summ, by = ".donor_id")
+    treatment_features <- c(treatment_confounders, paste0("mean_", treatment_cell_summaries))
+  } else {
+    treatment_features <- treatment_confounders
+  }
+
+  fold_df <- make_stratified_donor_folds(
+    donor_id = donor_meta$.donor_id,
+    treatment = donor_meta$.D,
+    n_folds = n_folds,
+    seed = seed
+  )
+
+  donor_meta <- dplyr::left_join(donor_meta, fold_df, by = c(".donor_id" = "donor_id"))
+  meta <- dplyr::left_join(meta, fold_df, by = c(".donor_id" = "donor_id"))
+
+  list(
+    meta = meta,
+    donor_meta = donor_meta,
+    treatment_features = treatment_features,
+    fold_df = fold_df
+  )
+}
+
 #' Prepare Metadata for DEDML Input
 #'
 #' Standardizes ID and phenotype fields used by [dedml_fit()] and optionally
@@ -153,6 +337,140 @@ dedml_prepare_metadata <- function(
   meta
 }
 
+#' Summarize and Validate a DEDML Design
+#'
+#' Checks donor balance, cross-fitting folds, cell-type representation, and
+#' treatment overlap for categorical and numeric confounders before running the
+#' expensive gene-level DEDML fit. Categorical confounder levels observed in
+#' only one treatment group are treated as fatal errors because the treatment
+#' effect is not identifiable for those levels. This catches common failures
+#' such as disease status being completely separated by batch, site, chemistry,
+#' or another design variable.
+#'
+#' @param meta Metadata data.frame.
+#' @param donor_id Donor id column name or vector.
+#' @param sample_id Sample id column name or vector. If `NULL`, donor id is used.
+#' @param treatment Treatment column name or vector (binary 0/1).
+#' @param cell_type Cell type column name or vector.
+#' @param confounder_spec Optional list from [dedml_make_confounder_spec()].
+#' @param treatment_confounders Donor-level confounders for the treatment model.
+#' @param treatment_cell_summaries Cell-level covariates summarized by donor for
+#' the treatment model.
+#' @param outcome_confounders Covariates for the outcome model.
+#' @param cell_types Optional cell types to keep before summarizing.
+#' @param n_folds Number of donor-blocked cross-fitting folds.
+#' @param donor_model Treatment model learner, either `"glm"` or `"lightgbm"`.
+#' @param treatment_params Optional treatment learner hyperparameters.
+#' @param seed Random seed for fold construction.
+#' @param drop_missing Whether to drop incomplete rows for selected confounders,
+#' matching [dedml_fit()] behavior.
+#' @param stop_on_error Whether to stop when fatal design diagnostics are found.
+#'
+#' @return A `dedml_design_summary` list with `summary`, `treatment`, `folds`,
+#' `cell_types`, `categorical`, `numeric`, and `diagnostics` tables.
+#' @export
+#'
+dedml_summarize_design <- function(
+    meta,
+    donor_id = "HATIMID",
+    sample_id = "sample_id",
+    treatment = "D",
+    cell_type = "CellType",
+    confounder_spec = NULL,
+    treatment_confounders = c("Age", "Sex"),
+    treatment_cell_summaries = c("log_nCount_RNA", "nFeature_RNA", "percent.mt"),
+    outcome_confounders = c("Age", "Sex", "log_nCount_RNA", "nFeature_RNA", "percent.mt"),
+    cell_types = NULL,
+    n_folds = 3L,
+    donor_model = c("glm", "lightgbm"),
+    treatment_params = list(),
+    seed = 123L,
+    drop_missing = TRUE,
+    stop_on_error = TRUE) {
+  donor_model <- match.arg(donor_model)
+  n_folds <- as.integer(n_folds)
+  if (is.na(n_folds) || n_folds < 2L) {
+    stop("n_folds must be at least 2.", call. = FALSE)
+  }
+
+  design_meta <- .dedml_prepare_design_metadata(
+    meta = meta,
+    donor_id = donor_id,
+    sample_id = sample_id,
+    treatment = treatment,
+    cell_type = cell_type,
+    confounder_spec = confounder_spec,
+    treatment_confounders = treatment_confounders,
+    treatment_cell_summaries = treatment_cell_summaries,
+    outcome_confounders = outcome_confounders,
+    cell_types = cell_types,
+    drop_missing = drop_missing
+  )
+
+  donor_design <- .dedml_build_donor_design(
+    meta = design_meta$meta,
+    treatment_confounders = design_meta$treatment_confounders,
+    treatment_cell_summaries = design_meta$treatment_cell_summaries,
+    n_folds = n_folds,
+    seed = seed
+  )
+
+  x_treat <- .build_design_matrix(donor_design$donor_meta, donor_design$treatment_features)
+  diagnostics <- .dedml_preflight_diagnostics(
+    meta = donor_design$meta,
+    donor_meta = donor_design$donor_meta,
+    treatment_confounders = design_meta$treatment_confounders,
+    treatment_features = donor_design$treatment_features,
+    outcome_confounders = design_meta$outcome_confounders,
+    n_folds = n_folds,
+    donor_model = donor_model,
+    treatment_params = treatment_params,
+    x_treat = x_treat,
+    separated_categorical_severity = "error"
+  )
+
+  report <- .dedml_design_report(
+    meta = donor_design$meta,
+    donor_meta = donor_design$donor_meta,
+    treatment_confounders = design_meta$treatment_confounders,
+    treatment_cell_summaries = design_meta$treatment_cell_summaries,
+    treatment_features = donor_design$treatment_features,
+    outcome_confounders = design_meta$outcome_confounders,
+    diagnostics = diagnostics
+  )
+
+  if (isTRUE(stop_on_error)) {
+    .dedml_stop_for_fatal_diagnostics(report$diagnostics)
+  }
+  report
+}
+
+#' @export
+print.dedml_design_summary <- function(x, ...) {
+  cat("DEDML design summary\n")
+  print(x$summary, row.names = FALSE)
+
+  if (nrow(x$treatment) > 0L) {
+    cat("\nTreatment balance\n")
+    print(x$treatment, row.names = FALSE)
+  }
+
+  if (nrow(x$diagnostics) > 0L) {
+    cat("\nDiagnostics\n")
+    print(x$diagnostics, row.names = FALSE)
+  } else {
+    cat("\nDiagnostics: no issues detected\n")
+  }
+
+  separated <- x$categorical[x$categorical$separated %in% TRUE, , drop = FALSE]
+  if (nrow(separated) > 0L) {
+    cat("\nSeparated categorical levels\n")
+    print(separated, row.names = FALSE)
+  }
+
+  invisible(x)
+}
+
 make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed = 123L) {
   stopifnot(length(donor_id) == length(treatment))
   donor_id <- as.character(donor_id)
@@ -211,6 +529,481 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     return(list(values = value_or_name, source = label))
   }
   stop(label, " must be a metadata column name or a vector with nrow(meta) elements.", call. = FALSE)
+}
+
+.dedml_diag_row <- function(severity, stage, check, message, recommendation) {
+  data.frame(
+    severity = severity,
+    stage = stage,
+    check = check,
+    message = message,
+    recommendation = recommendation,
+    stringsAsFactors = FALSE
+  )
+}
+
+.dedml_emit_diagnostic_warnings <- function(diagnostics, max_items = 6L) {
+  if (!is.data.frame(diagnostics) || nrow(diagnostics) == 0L) {
+    return(invisible(FALSE))
+  }
+  warn_df <- diagnostics[diagnostics$severity %in% c("warning", "error"), , drop = FALSE]
+  if (nrow(warn_df) == 0L) {
+    return(invisible(FALSE))
+  }
+  show_df <- utils::head(warn_df, max_items)
+  bullets <- .dedml_format_diagnostic_bullets(show_df, max_items = max_items)
+  more <- if (nrow(warn_df) > nrow(show_df)) {
+    paste0("\n- ... ", nrow(warn_df) - nrow(show_df), " more issue(s); inspect fit$diagnostics.")
+  } else {
+    "\nInspect fit$diagnostics for the full diagnostic table."
+  }
+  warning(
+    paste0(
+      "DEDML design diagnostics detected ", nrow(warn_df),
+      " potential issue(s):\n",
+      paste(bullets, collapse = "\n"),
+      more
+    ),
+    call. = FALSE
+  )
+  invisible(TRUE)
+}
+
+.dedml_effective_lgb_min_data_in_leaf <- function(params) {
+  candidates <- c("min_data_in_leaf", "min_data", "min_child_samples")
+  for (nm in candidates) {
+    if (!is.null(params[[nm]])) {
+      val <- suppressWarnings(as.integer(params[[nm]])[1])
+      if (is.finite(val) && val > 0L) {
+        return(val)
+      }
+    }
+  }
+  50L
+}
+
+.dedml_donor_numeric_summary <- function(meta, vars) {
+  vars <- vars[vars %in% colnames(meta)]
+  vars <- vars[vapply(meta[vars], function(x) is.numeric(x) || is.integer(x), logical(1L))]
+  if (length(vars) == 0L) {
+    return(NULL)
+  }
+  out <- dplyr::summarise(
+    dplyr::group_by(meta, .donor_id),
+    .D = .D[1],
+    dplyr::across(dplyr::all_of(vars), ~ mean(as.numeric(.x), na.rm = TRUE)),
+    .groups = "drop"
+  )
+  as.data.frame(out)
+}
+
+.dedml_design_report <- function(
+    meta,
+    donor_meta,
+    treatment_confounders,
+    treatment_cell_summaries,
+    treatment_features,
+    outcome_confounders,
+    diagnostics) {
+  treatment_summary <- dplyr::summarise(
+    dplyr::group_by(meta, .D),
+    donors = dplyr::n_distinct(.donor_id),
+    samples = dplyr::n_distinct(.sample_id),
+    cells = dplyr::n(),
+    .groups = "drop"
+  )
+  treatment_summary$treatment <- ifelse(treatment_summary$.D == 1L, "treated", "control")
+  treatment_summary <- treatment_summary[, c("treatment", ".D", "donors", "samples", "cells"), drop = FALSE]
+
+  fold_summary <- dplyr::summarise(
+    dplyr::group_by(donor_meta, fold),
+    donors = dplyr::n(),
+    treated_donors = sum(.D == 1L),
+    control_donors = sum(.D == 0L),
+    .groups = "drop"
+  )
+
+  celltype_summary <- dplyr::summarise(
+    dplyr::group_by(meta, .CellType),
+    cells = dplyr::n(),
+    donors = dplyr::n_distinct(.donor_id),
+    samples = dplyr::n_distinct(.sample_id),
+    treated_donors = dplyr::n_distinct(.donor_id[.D == 1L]),
+    control_donors = dplyr::n_distinct(.donor_id[.D == 0L]),
+    .groups = "drop"
+  )
+  names(celltype_summary)[names(celltype_summary) == ".CellType"] <- "cell_type"
+
+  cat_vars <- unique(c(treatment_confounders, outcome_confounders))
+  cat_vars <- cat_vars[cat_vars %in% colnames(meta)]
+  cat_vars <- cat_vars[vapply(meta[cat_vars], function(x) {
+    is.factor(x) || is.character(x) || is.logical(x)
+  }, logical(1L))]
+  categorical_summary <- lapply(cat_vars, function(var) {
+    df <- data.frame(
+      variable = var,
+      .donor_id = meta$.donor_id,
+      .D = meta$.D,
+      level = as.character(meta[[var]]),
+      stringsAsFactors = FALSE
+    )
+    df <- df[!is.na(df$level) & nzchar(df$level), , drop = FALSE]
+    if (nrow(df) == 0L) {
+      return(NULL)
+    }
+    donor_level <- unique(df[, c("variable", ".donor_id", ".D", "level"), drop = FALSE])
+    out <- dplyr::summarise(
+      dplyr::group_by(donor_level, variable, level),
+      donors = dplyr::n_distinct(.donor_id),
+      treated_donors = dplyr::n_distinct(.donor_id[.D == 1L]),
+      control_donors = dplyr::n_distinct(.donor_id[.D == 0L]),
+      .groups = "drop"
+    )
+    cell_counts <- dplyr::summarise(
+      dplyr::group_by(df, variable, level),
+      cells = dplyr::n(),
+      .groups = "drop"
+    )
+    out <- dplyr::left_join(out, cell_counts, by = c("variable", "level"))
+    out$role <- vapply(out$variable, function(v) {
+      in_treat <- v %in% treatment_confounders
+      in_outcome <- v %in% outcome_confounders
+      if (in_treat && in_outcome) {
+        "treatment,outcome"
+      } else if (in_treat) {
+        "treatment"
+      } else {
+        "outcome"
+      }
+    }, character(1L))
+    out$separated <- out$treated_donors == 0L | out$control_donors == 0L
+    out[, c("variable", "role", "level", "donors", "treated_donors", "control_donors", "cells", "separated"), drop = FALSE]
+  })
+  categorical_summary <- categorical_summary[!vapply(categorical_summary, is.null, logical(1L))]
+  categorical_summary <- if (length(categorical_summary) > 0L) {
+    as.data.frame(data.table::rbindlist(categorical_summary, fill = TRUE))
+  } else {
+    data.frame(
+      variable = character(),
+      role = character(),
+      level = character(),
+      donors = integer(),
+      treated_donors = integer(),
+      control_donors = integer(),
+      cells = integer(),
+      separated = logical(),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  num_vars <- unique(c(treatment_confounders, treatment_cell_summaries, treatment_features, outcome_confounders))
+  donor_num <- .dedml_donor_numeric_summary(meta, num_vars)
+  numeric_summary <- if (!is.null(donor_num)) {
+    out <- lapply(setdiff(colnames(donor_num), c(".donor_id", ".D")), function(var) {
+      x0 <- donor_num[[var]][donor_num$.D == 0L]
+      x1 <- donor_num[[var]][donor_num$.D == 1L]
+      x0 <- x0[is.finite(x0)]
+      x1 <- x1[is.finite(x1)]
+      if (length(x0) == 0L || length(x1) == 0L) {
+        return(NULL)
+      }
+      data.frame(
+        variable = var,
+        control_min = min(x0),
+        control_max = max(x0),
+        treated_min = min(x1),
+        treated_max = max(x1),
+        control_mean = mean(x0),
+        treated_mean = mean(x1),
+        overlap = !(max(x0) < min(x1) || max(x1) < min(x0)),
+        stringsAsFactors = FALSE
+      )
+    })
+    out <- out[!vapply(out, is.null, logical(1L))]
+    if (length(out) > 0L) {
+      as.data.frame(data.table::rbindlist(out, fill = TRUE))
+    } else {
+      NULL
+    }
+  } else {
+    NULL
+  }
+  if (is.null(numeric_summary)) {
+    numeric_summary <- data.frame(
+      variable = character(),
+      control_min = numeric(),
+      control_max = numeric(),
+      treated_min = numeric(),
+      treated_max = numeric(),
+      control_mean = numeric(),
+      treated_mean = numeric(),
+      overlap = logical(),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  summary <- data.frame(
+    n_cells = nrow(meta),
+    n_donors = nrow(donor_meta),
+    n_samples = dplyr::n_distinct(meta$.sample_id),
+    n_celltypes = dplyr::n_distinct(meta$.CellType),
+    n_treated_donors = sum(donor_meta$.D == 1L),
+    n_control_donors = sum(donor_meta$.D == 0L),
+    n_diagnostics = nrow(diagnostics),
+    n_errors = sum(diagnostics$severity == "error"),
+    n_warnings = sum(diagnostics$severity == "warning"),
+    stringsAsFactors = FALSE
+  )
+
+  out <- list(
+    summary = summary,
+    treatment = as.data.frame(treatment_summary),
+    folds = as.data.frame(fold_summary),
+    cell_types = as.data.frame(celltype_summary),
+    categorical = categorical_summary,
+    numeric = numeric_summary,
+    diagnostics = diagnostics
+  )
+  class(out) <- "dedml_design_summary"
+  out
+}
+
+.dedml_preflight_diagnostics <- function(
+    meta,
+    donor_meta,
+    treatment_confounders,
+    treatment_features,
+    outcome_confounders,
+    n_folds,
+    donor_model,
+    treatment_params,
+    x_treat = NULL,
+    separated_categorical_severity = "error") {
+  separated_categorical_severity <- match.arg(separated_categorical_severity, c("error", "warning"))
+  diag_list <- list()
+  add <- function(...) {
+    diag_list[[length(diag_list) + 1L]] <<- .dedml_diag_row(...)
+  }
+
+  n_donors <- nrow(donor_meta)
+  n_treated <- sum(donor_meta$.D == 1L, na.rm = TRUE)
+  n_control <- sum(donor_meta$.D == 0L, na.rm = TRUE)
+  min_group <- min(n_treated, n_control)
+
+  if (n_treated == 0L || n_control == 0L) {
+    add(
+      "error", "treatment_model", "one_treatment_class",
+      paste0("Only one treatment class is present at donor level: treated=", n_treated, ", control=", n_control, "."),
+      "DEDML requires both treated and control donors; check treatment coding and cohort selection."
+    )
+  } else if (min_group < 5L) {
+    add(
+      "warning", "treatment_model", "small_treatment_group",
+      paste0("Smallest donor treatment group has ", min_group, " donor(s) out of ", n_donors, "."),
+      "Use fewer folds, simplify treatment confounders, or collect more donors before relying on treatment residualization."
+    )
+  }
+
+  fold_tab <- table(donor_meta$fold, donor_meta$.D)
+  for (val in c("0", "1")) {
+    if (!val %in% colnames(fold_tab)) {
+      fold_tab <- cbind(fold_tab, stats::setNames(rep(0L, nrow(fold_tab)), val))
+    }
+  }
+  test_min_treated <- min(fold_tab[, "1"], na.rm = TRUE)
+  test_min_control <- min(fold_tab[, "0"], na.rm = TRUE)
+  train_counts <- lapply(sort(unique(donor_meta$fold)), function(k) {
+    idx <- donor_meta$fold != k
+    c(
+      fold = k,
+      n_train = sum(idx),
+      train_treated = sum(donor_meta$.D[idx] == 1L),
+      train_control = sum(donor_meta$.D[idx] == 0L)
+    )
+  })
+  train_counts <- as.data.frame(do.call(rbind, train_counts))
+  min_train_treated <- min(train_counts$train_treated, na.rm = TRUE)
+  min_train_control <- min(train_counts$train_control, na.rm = TRUE)
+  min_train_total <- min(train_counts$n_train, na.rm = TRUE)
+
+  if (n_treated < n_folds || n_control < n_folds || test_min_treated == 0L || test_min_control == 0L) {
+    add(
+      "warning", "cross_fitting", "fold_missing_class",
+      paste0(
+        "At least one held-out fold lacks treated or control donors ",
+        "(min held-out treated=", test_min_treated, ", min held-out control=", test_min_control, ")."
+      ),
+      "Reduce n_folds so every fold has both treatment groups, or use more donors."
+    )
+  }
+  if (min_train_treated == 0L || min_train_control == 0L) {
+    add(
+      "error", "cross_fitting", "training_fold_missing_class",
+      paste0(
+        "At least one treatment-model training split lacks a class ",
+        "(min training treated=", min_train_treated, ", min training control=", min_train_control, ")."
+      ),
+      "Use fewer folds or increase the smaller treatment group; treatment propensities cannot be learned from one class."
+    )
+  } else if (min(min_train_treated, min_train_control) < 5L) {
+    add(
+      "warning", "cross_fitting", "small_training_class",
+      paste0(
+        "Smallest treatment-model training split has treated=", min_train_treated,
+        " and control=", min_train_control, " donor(s)."
+      ),
+      "Use fewer folds and a simpler treatment model; cross-fitted propensity estimates may be unstable."
+    )
+  }
+
+  if (donor_model == "lightgbm") {
+    min_leaf <- .dedml_effective_lgb_min_data_in_leaf(treatment_params)
+    if (min_train_total < 2L * min_leaf) {
+      add(
+        "warning", "treatment_model", "lightgbm_cannot_split",
+        paste0(
+          "LightGBM treatment model has min_data_in_leaf=", min_leaf,
+          " but the smallest training split has ", min_train_total,
+          " donors; tree splits are unlikely or impossible."
+        ),
+        "Lower treatment_params$min_data_in_leaf, use donor_model='glm', use fewer folds, or increase donor count."
+      )
+    }
+  }
+
+  if (!is.null(x_treat)) {
+    n_features <- ncol(x_treat)
+    if (n_features >= max(1L, min_train_total - 2L)) {
+      add(
+        "warning", "treatment_model", "too_many_treatment_features",
+        paste0("Treatment model uses ", n_features, " design columns with as few as ", min_train_total, " training donors."),
+        "Reduce donor confounders/categorical levels or use regularized treatment modeling."
+      )
+    }
+  }
+
+  cat_vars <- unique(c(treatment_confounders, outcome_confounders))
+  cat_vars <- cat_vars[cat_vars %in% colnames(meta)]
+  cat_vars <- cat_vars[vapply(meta[cat_vars], function(x) {
+    is.factor(x) || is.character(x) || is.logical(x)
+  }, logical(1L))]
+  for (var in cat_vars) {
+    df <- unique(data.frame(
+      .donor_id = meta$.donor_id,
+      .D = meta$.D,
+      level = as.character(meta[[var]]),
+      stringsAsFactors = FALSE
+    ))
+    df <- df[!is.na(df$level) & nzchar(df$level), , drop = FALSE]
+    if (nrow(df) == 0L) {
+      next
+    }
+    lvl <- dplyr::summarise(
+      dplyr::group_by(df, level),
+      donors = dplyr::n_distinct(.donor_id),
+      treated = dplyr::n_distinct(.donor_id[.D == 1L]),
+      control = dplyr::n_distinct(.donor_id[.D == 0L]),
+      .groups = "drop"
+    )
+    bad <- lvl[lvl$treated == 0L | lvl$control == 0L, , drop = FALSE]
+    if (nrow(bad) > 0L) {
+      examples <- paste0(
+        utils::head(bad$level, 5L),
+        "(treated=", utils::head(bad$treated, 5L),
+        ", control=", utils::head(bad$control, 5L), ")"
+      )
+      stage <- if (var %in% treatment_confounders) "treatment_model" else "outcome_model"
+      add(
+        separated_categorical_severity, stage, "separated_categorical_level",
+        paste0("Covariate '", var, "' has level(s) observed in only one treatment group: ", paste(examples, collapse = ", "), "."),
+        "Combine sparse levels, restrict to overlapping batches/sites, or interpret disease effects as not identifiable from this covariate."
+      )
+    }
+  }
+
+  num_vars <- unique(c(treatment_confounders, treatment_features, outcome_confounders))
+  donor_num <- .dedml_donor_numeric_summary(meta, num_vars)
+  if (!is.null(donor_num)) {
+    for (var in setdiff(colnames(donor_num), c(".donor_id", ".D"))) {
+      x0 <- donor_num[[var]][donor_num$.D == 0L]
+      x1 <- donor_num[[var]][donor_num$.D == 1L]
+      x0 <- x0[is.finite(x0)]
+      x1 <- x1[is.finite(x1)]
+      if (length(x0) == 0L || length(x1) == 0L) {
+        next
+      }
+      no_overlap <- max(x0) < min(x1) || max(x1) < min(x0)
+      if (isTRUE(no_overlap)) {
+        add(
+          "warning", "confounding", "numeric_nonoverlap",
+          paste0("Numeric covariate '", var, "' has non-overlapping donor-level ranges between treatment groups."),
+          "Check positivity/overlap; DEDML cannot separate treatment from a confounder with no treated-control overlap."
+        )
+      }
+    }
+  }
+
+  if (length(diag_list) == 0L) {
+    return(.dedml_default_empty_diagnostics())
+  }
+  as.data.frame(data.table::rbindlist(diag_list, fill = TRUE))
+}
+
+.dedml_propensity_diagnostics <- function(donor_meta) {
+  diag_list <- list()
+  add <- function(...) {
+    diag_list[[length(diag_list) + 1L]] <<- .dedml_diag_row(...)
+  }
+  e <- suppressWarnings(as.numeric(donor_meta$propensity_oof))
+  if (length(e) == 0L || all(!is.finite(e))) {
+    add(
+      "warning", "treatment_model", "invalid_propensity",
+      "Treatment model produced no finite cross-fitted propensity estimates.",
+      "Check treatment coding, treatment model settings, and donor-level confounders."
+    )
+  } else {
+    finite_e <- e[is.finite(e)]
+    near_zero <- mean(finite_e <= 0.01)
+    near_one <- mean(finite_e >= 0.99)
+    sd_e <- stats::sd(finite_e)
+    if (near_zero + near_one >= 0.5) {
+      add(
+        "warning", "treatment_model", "boundary_propensity",
+        paste0(
+          round(100 * (near_zero + near_one), 1),
+          "% of donors have propensity <=0.01 or >=0.99."
+        ),
+        "This suggests separation, severe imbalance, or overfitting; simplify confounders, use fewer folds, or use a more stable treatment model."
+      )
+    }
+    if (is.finite(sd_e) && sd_e < 0.01) {
+      add(
+        "warning", "treatment_model", "near_constant_propensity",
+        paste0("Cross-fitted propensities are nearly constant (sd=", signif(sd_e, 3), ")."),
+        "Treatment residualization is close to using raw treatment; check whether the treatment model is too constrained or underfit."
+      )
+    }
+    e_treated <- e[donor_meta$.D == 1L]
+    e_control <- e[donor_meta$.D == 0L]
+    if (length(e_treated) > 0L && mean(e_treated <= 0.05, na.rm = TRUE) >= 0.5) {
+      add(
+        "warning", "treatment_model", "treated_low_propensity",
+        "Most treated donors have fitted propensity <=0.05.",
+        "Check treatment coding and positivity; treated donors look impossible under the fitted treatment model."
+      )
+    }
+    if (length(e_control) > 0L && mean(e_control >= 0.95, na.rm = TRUE) >= 0.5) {
+      add(
+        "warning", "treatment_model", "control_high_propensity",
+        "Most control donors have fitted propensity >=0.95.",
+        "Check treatment coding and positivity; control donors look impossible under the fitted treatment model."
+      )
+    }
+  }
+  if (length(diag_list) == 0L) {
+    return(.dedml_default_empty_diagnostics())
+  }
+  as.data.frame(data.table::rbindlist(diag_list, fill = TRUE))
 }
 
 .fit_predict_glm_binomial <- function(x_train, y_train, x_test) {
@@ -498,7 +1291,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
 }
 
 .fit_predict_outcome <- function(x_train, y_train, x_test, learner, params = list()) {
-  distribution <- match.arg(params$outcome_distribution, c("gaussian", "poisson", "nb"))
+  distribution <- match.arg(params$outcome_distribution, c("poisson", "gaussian", "nb"))
   params$outcome_distribution <- NULL
 
   if (learner == "lightgbm") {
@@ -557,7 +1350,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     y,
     mu,
     cell_type,
-    outcome_distribution = c("gaussian", "poisson", "nb"),
+    outcome_distribution = c("poisson", "gaussian", "nb"),
     nb_size = NULL,
     nb_size_min = 0.1,
     nb_size_max = 1e6) {
@@ -604,7 +1397,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     estimate,
     mu,
     propensity,
-    outcome_distribution = c("gaussian", "poisson", "nb"),
+    outcome_distribution = c("poisson", "gaussian", "nb"),
     nb_size = NA_real_) {
   outcome_distribution <- match.arg(outcome_distribution)
   estimate <- suppressWarnings(as.numeric(estimate))[1]
@@ -721,7 +1514,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
 .append_logfc_effect_sizes <- function(
     result_df,
     mu_factor_df,
-    outcome_distribution = c("gaussian", "poisson", "nb")) {
+    outcome_distribution = c("poisson", "gaussian", "nb")) {
   outcome_distribution <- match.arg(outcome_distribution)
   if (!is.data.frame(result_df) || nrow(result_df) == 0L ||
       is.null(mu_factor_df) || nrow(mu_factor_df) == 0L) {
@@ -1120,6 +1913,7 @@ fit_residual_regression_pseudobulk_matrix <- function(
     error_list,
     donor_meta,
     settings,
+    diagnostics = NULL,
     pvalue_calibration,
     calibration_quantile) {
   if (length(result_list) == 0L) {
@@ -1164,6 +1958,7 @@ fit_residual_regression_pseudobulk_matrix <- function(
     results = as.data.frame(result_df),
     donor_meta = donor_meta,
     settings = settings,
+    diagnostics = diagnostics,
     errors = if (length(error_list) > 0L) data.table::rbindlist(error_list, fill = TRUE) else NULL
   )
 }
@@ -1176,11 +1971,21 @@ fit_residual_regression_pseudobulk_matrix <- function(
   .Platform$OS.type != "windows"
 }
 
-.dedml_make_psock_cluster <- function(n_cores) {
-  tryCatch(
-    parallel::makeCluster(n_cores),
-    error = function(e) e
-  )
+.dedml_make_psock_cluster <- function(n_cores, lib_paths = .libPaths()) {
+  tryCatch({
+    cl <- parallel::makeCluster(n_cores)
+    tryCatch(
+      parallel::clusterCall(cl, function(paths) {
+        .libPaths(paths)
+        invisible(.libPaths())
+      }, lib_paths),
+      error = function(e) {
+        parallel::stopCluster(cl)
+        stop(e)
+      }
+    )
+    cl
+  }, error = function(e) e)
 }
 
 .dedml_poisson_irls_psock_block <- function(indices) {
@@ -1234,8 +2039,9 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @param donor_model Donor treatment model (`"glm"` or `"lightgbm"`).
 #' @param outcome_model Outcome model (`"lightgbm"` or `"glm"`).
 #' @param outcome_distribution Outcome likelihood/working distribution:
-#' `"gaussian"`, `"poisson"`, or `"nb"`. For `outcome_model = "glm"`,
-#' Gaussian and Poisson use `stats::glm.fit()` and NB uses `mgcv::gam()`
+#' `"poisson"` by default, with `"gaussian"` and `"nb"` also available.
+#' For `outcome_model = "glm"`, Poisson and Gaussian use `stats::glm.fit()`
+#' and NB uses `mgcv::gam()`
 #' with `mgcv::nb()`. For `outcome_model = "lightgbm"`, these map to
 #' LightGBM L2 regression, Poisson, and free-dispersion NB objectives.
 #' Gaussian/L2 changes only the nuisance mean learner; its final residual
@@ -1272,14 +2078,19 @@ fit_residual_regression_pseudobulk_matrix <- function(
 #' @param treatment_learner Deprecated alias for `donor_model`.
 #' @param outcome_learner Deprecated alias for `outcome_model`.
 #'
-#' @return A list with `results`, `donor_meta`, `settings`, and `errors`.
+#' @return A list with `results`, `donor_meta`, `settings`, `diagnostics`,
+#' and `errors`.
 #' The `results` table reports the residual-scale DEDML effect in `estimate`.
 #' It also includes `estimate_logfc`, a practical post-hoc log fold-change
 #' effect size targeting the untreated-baseline mean. The conversion uses the
 #' out-of-fold nuisance mean and treatment propensity; `"gaussian"` and
 #' `"poisson"` use the Poisson residual scale, while `"nb"` uses the
 #' negative-binomial residual scale. DEDML inference uses the residual-scale
-#' statistic and p-value.
+#' statistic and p-value. The `diagnostics` table records design and treatment
+#' model issues such as weak fold overlap, numeric non-overlap, and degenerate
+#' propensity estimates. Fatal design diagnostics, including separated
+#' categorical batch/site/confounder levels observed in only one treatment
+#' group, stop the fit before model training.
 #' @export
 #'
 dedml_fit <- function(
@@ -1438,7 +2249,11 @@ dedml_fit <- function(
     stop("Missing confounder columns in meta: ", paste(missing_needed, collapse = ", "), call. = FALSE)
   }
 
-  keep_complete <- stats::complete.cases(meta[, needed_cols, drop = FALSE])
+  keep_complete <- if (length(needed_cols) > 0L) {
+    stats::complete.cases(meta[, needed_cols, drop = FALSE])
+  } else {
+    rep(TRUE, nrow(meta))
+  }
   counts <- counts[, keep_complete, drop = FALSE]
   meta <- meta[keep_complete, , drop = FALSE]
 
@@ -1482,6 +2297,20 @@ dedml_fit <- function(
   meta <- dplyr::left_join(meta, fold_df, by = c(".donor_id" = "donor_id"))
 
   x_treat <- .build_design_matrix(donor_meta, treatment_features)
+  diagnostics <- .dedml_preflight_diagnostics(
+    meta = meta,
+    donor_meta = donor_meta,
+    treatment_confounders = treatment_confounders,
+    treatment_features = treatment_features,
+    outcome_confounders = outcome_confounders,
+    n_folds = n_folds,
+    donor_model = donor_model,
+    treatment_params = treatment_params,
+    x_treat = x_treat
+  )
+  .dedml_emit_diagnostic_warnings(diagnostics)
+  .dedml_stop_for_fatal_diagnostics(diagnostics)
+
   donor_meta$propensity_oof <- NA_real_
 
   for (k in seq_len(n_folds)) {
@@ -1498,6 +2327,14 @@ dedml_fit <- function(
   }
 
   donor_meta$D_resid <- donor_meta$.D - donor_meta$propensity_oof
+  propensity_diagnostics <- .dedml_propensity_diagnostics(donor_meta)
+  if (nrow(propensity_diagnostics) > 0L) {
+    diagnostics <- as.data.frame(data.table::rbindlist(
+      list(diagnostics, propensity_diagnostics),
+      fill = TRUE
+    ))
+    .dedml_emit_diagnostic_warnings(propensity_diagnostics)
+  }
 
   meta <- dplyr::left_join(
     meta,
@@ -1756,6 +2593,7 @@ dedml_fit <- function(
       error_list = list(),
       donor_meta = donor_meta,
       settings = settings,
+      diagnostics = diagnostics,
       pvalue_calibration = pvalue_calibration,
       calibration_quantile = calibration_quantile
     ))
@@ -1927,6 +2765,7 @@ dedml_fit <- function(
       error_list = list(),
       donor_meta = donor_meta,
       settings = settings,
+      diagnostics = diagnostics,
       pvalue_calibration = pvalue_calibration,
       calibration_quantile = calibration_quantile
     ))
@@ -2064,6 +2903,7 @@ dedml_fit <- function(
     error_list = error_list,
     donor_meta = donor_meta,
     settings = settings,
+    diagnostics = diagnostics,
     pvalue_calibration = pvalue_calibration,
     calibration_quantile = calibration_quantile
   )
@@ -2083,7 +2923,8 @@ dedml_fit <- function(
 #' @param cell_type Cell type column.
 #' @param ... Additional arguments passed to [dedml_fit()].
 #'
-#' @return A list with `results`, `donor_meta`, `settings`, and `errors`.
+#' @return A list with `results`, `donor_meta`, `settings`, `diagnostics`,
+#' and `errors`.
 #' @export
 #'
 dedml_fit_seurat <- function(
