@@ -1,7 +1,7 @@
 Package: DEDML
 Type: Package
 Title: Donor-Blocked Double Machine Learning for Single-Cell Differential Expression
-Version: 0.1.5
+Version: 0.1.6
 Authors@R: c(
     person(given = "Yuxin", family = "Yin", role = c("aut", "cre"),
            email = "yyin0906@gmail.com")

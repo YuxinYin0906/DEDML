@@ -1857,6 +1857,11 @@ fit_residual_regression_pseudobulk_matrix <- function(
       colnames(contrast) <- colnames(x)
 
       est_mat <- contrast %*% coef_mat
+      resid_mat <- fit$residuals
+      if (is.null(dim(resid_mat))) {
+        resid_mat <- matrix(resid_mat, ncol = 1L)
+      }
+      colnames(resid_mat) <- gene_names[batch_genes]
       repeated_donor_samples <- any(table(pb_df$donor_id) > 1L)
       n_unique_donors <- length(unique(pb_df$donor_id))
       use_cluster <- isTRUE(cluster_robust) && repeated_donor_samples && n_unique_donors >= 2L
@@ -1868,7 +1873,7 @@ fit_residual_regression_pseudobulk_matrix <- function(
         wx <- x * w
         for (donor in donor_levels) {
           idx <- which(pb_df$donor_id == donor)
-          score_d <- crossprod(wx[idx, , drop = FALSE], fit$residuals[idx, , drop = FALSE])
+          score_d <- crossprod(wx[idx, , drop = FALSE], resid_mat[idx, , drop = FALSE])
           z_d <- b_mat %*% score_d
           var_mat <- var_mat + z_d^2
         }
@@ -1878,7 +1883,7 @@ fit_residual_regression_pseudobulk_matrix <- function(
         var_mat <- df_correction * var_mat
         se_method <- "donor_cluster_robust"
       } else {
-        sigma2 <- colSums(w * fit$residuals^2) / fit$df.residual
+        sigma2 <- colSums(w * resid_mat^2) / fit$df.residual
         contrast_var <- diag(contrast %*% a_inv %*% t(contrast))
         var_mat <- outer(contrast_var, sigma2)
         se_method <- "model_based"
@@ -2189,6 +2194,11 @@ fit_residual_regression_pseudobulk_matrix_from_pb <- function(
   colnames(contrast) <- colnames(x)
 
   est_mat <- contrast %*% coef_mat
+  resid_mat <- fit$residuals
+  if (is.null(dim(resid_mat))) {
+    resid_mat <- matrix(resid_mat, ncol = 1L)
+  }
+  colnames(resid_mat) <- batch_gene_names
   repeated_donor_samples <- any(table(pb_df$donor_id) > 1L)
   n_unique_donors <- length(unique(pb_df$donor_id))
   use_cluster <- isTRUE(cluster_robust) && repeated_donor_samples && n_unique_donors >= 2L
@@ -2199,7 +2209,7 @@ fit_residual_regression_pseudobulk_matrix_from_pb <- function(
     wx <- x * w
     for (donor in donor_levels) {
       idx <- which(pb_df$donor_id == donor)
-      score_d <- crossprod(wx[idx, , drop = FALSE], fit$residuals[idx, , drop = FALSE])
+      score_d <- crossprod(wx[idx, , drop = FALSE], resid_mat[idx, , drop = FALSE])
       z_d <- b_mat %*% score_d
       var_mat <- var_mat + z_d^2
     }
@@ -2209,7 +2219,7 @@ fit_residual_regression_pseudobulk_matrix_from_pb <- function(
     var_mat <- df_correction * var_mat
     se_method <- "donor_cluster_robust"
   } else {
-    sigma2 <- colSums(w * fit$residuals^2) / fit$df.residual
+    sigma2 <- colSums(w * resid_mat^2) / fit$df.residual
     contrast_var <- diag(contrast %*% a_inv %*% t(contrast))
     var_mat <- outer(contrast_var, sigma2)
     se_method <- "model_based"
@@ -2859,6 +2869,16 @@ dedml_fit <- function(
   if (parallel_backend == "fork" && !.dedml_fork_available()) {
     if (isTRUE(verbose)) {
       message("parallel_backend='fork' is unavailable on this platform; using 'psock'.")
+    }
+    parallel_backend <- "psock"
+  }
+  if (parallel_backend == "fork" && n_cores > 1L &&
+      (donor_model == "lightgbm" || outcome_learner == "lightgbm")) {
+    if (isTRUE(verbose)) {
+      message(
+        "parallel_backend='fork' is not used with LightGBM because ",
+        "LightGBM/OpenMP state is not fork-safe; using 'psock'."
+      )
     }
     parallel_backend <- "psock"
   }

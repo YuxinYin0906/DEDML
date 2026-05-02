@@ -92,7 +92,9 @@ cell-type-specific upper-tail statistic inflation before BH adjustment.}
 \code{pvalue_calibration = "tail"}.}
 \item{parallel_backend}{Gene-level parallel backend. With \code{n_cores > 1},
 \code{"auto"} uses PSOCK workers for portability; \code{"fork"} remains
-available as an explicit opt-in on platforms that support it.}
+available as an explicit opt-in on platforms that support it. LightGBM-backed
+fits are automatically switched from \code{"fork"} to \code{"psock"} because
+the LightGBM/OpenMP runtime is not fork-safe after process forking.}
 \item{gene_chunk_size}{Number of genes per parallel task. If \code{NULL},
 DEDML chooses a backend-aware value. This also controls the maximum number of
 genes materialized together for batched residual regression.}

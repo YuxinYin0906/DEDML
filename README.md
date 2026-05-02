@@ -13,7 +13,7 @@ remotes::install_github("YuxinYin0906/DEDML")
 From a release/source tarball:
 
 ```r
-install.packages("DEDML_0.1.5.tar.gz", repos = NULL, type = "source")
+install.packages("DEDML_0.1.6.tar.gz", repos = NULL, type = "source")
 ```
 
 ## Main function
@@ -35,7 +35,9 @@ Use `dedml_fit()` with simplified input names:
 Parallel gene-level fitting defaults to `parallel_backend = "auto"`. In this
 mode, DEDML uses PSOCK workers when `n_cores > 1`, which is portable across
 Unix-like systems, Windows, and LightGBM-backed runs. `parallel_backend =
-"fork"` is still available as an explicit opt-in on platforms that support it.
+"fork"` is still available as an explicit opt-in on platforms that support it,
+but DEDML automatically switches LightGBM-backed fits to PSOCK because the
+LightGBM/OpenMP runtime is not fork-safe after process forking.
 If local socket worker creation is restricted by the environment, DEDML falls
 back to serial execution instead of failing the analysis.
 
