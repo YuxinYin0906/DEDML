@@ -71,7 +71,11 @@ and NB uses \code{mgcv::gam()} with \code{mgcv::nb()}. For
 Poisson, and free-dispersion NB objectives. Gaussian/L2 changes only the
 nuisance mean learner; its final residual conversion still uses Poisson
 variance.}
-\item{treatment_params}{Optional donor model hyperparameters.}
+\item{treatment_params}{Optional donor model hyperparameters. For
+\code{donor_model = "lightgbm"}, DEDML uses treatment-specific regularized
+defaults and adapts \code{min_data_in_leaf} to the donor-level training split
+size by default. Set \code{adaptive = FALSE} inside this list to use exact
+user-specified LightGBM treatment hyperparameters.}
 \item{outcome_params}{Optional outcome learner hyperparameters. The outcome
 objective/family is controlled by \code{outcome_distribution}, so redundant
 \code{objective}, \code{metric}, and \code{family} entries are ignored. For
@@ -108,19 +112,22 @@ genes materialized together for batched residual regression.}
 \item{treatment_learner}{Deprecated alias for \code{donor_model}.}
 }
 \value{
-A list with \code{results}, \code{donor_meta}, \code{settings},
-\code{diagnostics}, and \code{errors}.
+A list with \code{results}, \code{gene_results}, \code{donor_meta},
+\code{settings}, \code{diagnostics}, and \code{errors}.
 The \code{results} table reports the residual-scale DEDML effect in
 \code{estimate}. It also includes \code{estimate_logfc}, a practical post-hoc
 log fold-change effect size targeting the untreated-baseline mean. The
 conversion uses the out-of-fold nuisance mean and treatment propensity:
 \code{"gaussian"} and \code{"poisson"} use the Poisson residual scale, while
 \code{"nb"} uses the negative-binomial residual scale. DEDML inference uses the
-residual-scale statistic and p-value. The \code{diagnostics} table records
-design and treatment model issues such as weak fold overlap, numeric
-non-overlap, and degenerate propensity estimates. Fatal design diagnostics,
-including separated categorical batch/site/confounder levels observed in only
-one treatment group, stop the fit before model training.
+residual-scale statistic and p-value. The \code{gene_results} table reports a
+gene-level global Wald test of the joint null that all fitted
+cell-type-specific effects for a gene are zero, using the joint covariance of
+the residual-regression contrasts. The \code{diagnostics} table records design
+and treatment model issues such as weak fold overlap, numeric non-overlap, and
+degenerate propensity estimates. Fatal design diagnostics, including separated
+categorical batch/site/confounder levels observed in only one treatment group,
+stop the fit before model training.
 }
 \description{
 Run donor-blocked cross-fitted double machine learning with configurable

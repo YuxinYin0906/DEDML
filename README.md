@@ -13,7 +13,7 @@ remotes::install_github("YuxinYin0906/DEDML")
 From a release/source tarball:
 
 ```r
-install.packages("DEDML_0.1.6.tar.gz", repos = NULL, type = "source")
+install.packages("DEDML_0.1.8.tar.gz", repos = NULL, type = "source")
 ```
 
 ## Main function
@@ -40,6 +40,15 @@ but DEDML automatically switches LightGBM-backed fits to PSOCK because the
 LightGBM/OpenMP runtime is not fork-safe after process forking.
 If local socket worker creation is restricted by the environment, DEDML falls
 back to serial execution instead of failing the analysis.
+
+When `donor_model = "lightgbm"`, DEDML uses treatment-specific LightGBM
+defaults that are regularized for donor-level sample sizes. This is separate
+from the outcome LightGBM settings because the treatment model has one row per
+donor, not one row per cell. By default, DEDML also adapts
+`min_data_in_leaf` within each cross-fitting split so the donor-level treatment
+tree can split without using very small unstable leaves. To use exact
+user-specified LightGBM treatment hyperparameters, set
+`treatment_params = list(adaptive = FALSE, ...)`.
 
 `outcome_model` controls the level of the nuisance outcome model. Use
 `outcome_model = "cell"` for cell-level nuisance fitting, or

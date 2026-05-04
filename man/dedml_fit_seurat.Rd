@@ -24,7 +24,8 @@ dedml_fit_seurat(
 \item{...}{Arguments passed to \code{dedml_fit}.}
 }
 \value{
-A list with \code{results}, \code{donor_meta}, \code{settings}, and \code{errors}.
+A list with \code{results}, \code{gene_results}, \code{donor_meta},
+\code{settings}, \code{diagnostics}, and \code{errors}.
 }
 \description{
 Convenience wrapper that extracts counts and metadata from Seurat and runs
