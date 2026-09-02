@@ -823,7 +823,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
 
 #' Run Structured Sum-Pseudobulk DEDML
 #'
-#' Runs the structured sum-pseudobulk DEDML pipeline used for the COVID real-data analyses.
+#' Runs a structured sum-pseudobulk DEDML pipeline.
 #'
 #' @param counts Gene-by-cell count matrix.
 #' @param meta Cell metadata data.frame.
