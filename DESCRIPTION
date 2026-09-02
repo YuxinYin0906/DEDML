@@ -1,7 +1,7 @@
 Package: DEDML
 Type: Package
 Title: Donor-Blocked Double Machine Learning for Single-Cell Differential Expression
-Version: 0.1.8
+Version: 0.1.9
 Authors@R: c(
     person(given = "Yuxin", family = "Yin", role = c("aut", "cre"),
            email = "yyin0906@gmail.com")
@@ -29,5 +29,7 @@ Suggests:
     MASS,
     Matrix,
     mgcv,
-    Seurat
+    Seurat,
+    testthat (>= 3.0.0)
 RoxygenNote: 7.3.2
+Config/testthat/edition: 3

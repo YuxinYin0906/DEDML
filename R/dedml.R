@@ -10,8 +10,14 @@ available_dedml_learners <- function() {
 if (getRversion() >= "2.15.1") {
   utils::globalVariables(c(
     ".CellType", ".DEDML_POISSON_IRLS_STATE", ".DEDML_PSOCK_STATE",
-    ".sample_id", ".unit_key", "donor_id", "fold", "level", "sample_id",
-    "p_value", "statistic", "tail_lambda", "variable", "wald_df"
+    ".sample_id", ".unit_key", ":=", ".", ".N", ".SD", "D",
+    "elapsed_sec", "estimate_logfc", "family", "finite_metric_ok", "gene",
+    "HATIMID", "mean_cell_percent.mt", "median_abs_estimate",
+    "median_abs_estimate_logfc", "n_gene_errors", "n_tests",
+    "outcome_structure", "p_adj", "percent.mt", "run_label", "score",
+    "selected_rule", "treatment_variant", "tuning_score", "unit_id",
+    "variant", "donor_id", "fold", "level", "sample_id", "p_value",
+    "statistic", "tail_lambda", "variable", "wald_df"
   ))
 }
 
@@ -506,6 +512,513 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     data.frame(donor_id = donors1, fold = fold1, stringsAsFactors = FALSE)
   )
   out
+}
+
+.dedml_matrix_col_sums <- function(x) {
+  if (requireNamespace("Matrix", quietly = TRUE) && inherits(x, "Matrix")) {
+    return(as.numeric(Matrix::colSums(x)))
+  }
+  as.numeric(colSums(x))
+}
+
+.dedml_matrix_row_sums <- function(x) {
+  if (requireNamespace("Matrix", quietly = TRUE) && inherits(x, "Matrix")) {
+    return(as.numeric(Matrix::rowSums(x)))
+  }
+  as.numeric(rowSums(x))
+}
+
+.dedml_make_sum_pseudobulk <- function(
+    counts,
+    meta,
+    donor_id,
+    sample_id,
+    treatment,
+    cell_type,
+    cell_types,
+    treatment_confounders,
+    outcome_confounders) {
+  if (!is.matrix(counts) && !inherits(counts, "Matrix")) {
+    stop("counts must be a matrix or Matrix object.", call. = FALSE)
+  }
+  if (!requireNamespace("Matrix", quietly = TRUE)) {
+    stop("Package 'Matrix' is required for structured pseudobulk.", call. = FALSE)
+  }
+  meta <- as.data.frame(meta, stringsAsFactors = FALSE)
+  if (is.null(sample_id)) sample_id <- donor_id
+
+  if (ncol(counts) != nrow(meta)) {
+    if (!is.null(colnames(counts)) && !is.null(rownames(meta))) {
+      shared <- intersect(colnames(counts), rownames(meta))
+      if (!length(shared)) stop("Could not align counts columns and meta rows.", call. = FALSE)
+      counts <- counts[, shared, drop = FALSE]
+      meta <- meta[shared, , drop = FALSE]
+    } else {
+      stop("counts columns must align with meta rows.", call. = FALSE)
+    }
+  }
+  if (is.null(colnames(counts))) colnames(counts) <- paste0("cell_", seq_len(ncol(counts)))
+
+  donor_res <- .resolve_input_column(meta, donor_id, "donor_id")
+  sample_res <- .resolve_input_column(meta, sample_id, "sample_id")
+  treatment_res <- .resolve_input_column(meta, treatment, "treatment")
+  celltype_res <- .resolve_input_column(meta, cell_type, "cell_type")
+
+  meta$.dedml_cell_id <- colnames(counts)
+  meta$.donor_id <- as.character(donor_res$values)
+  meta$.sample_id <- as.character(sample_res$values)
+  meta$.D <- as.integer(treatment_res$values)
+  meta$.CellType <- as.character(celltype_res$values)
+  if (!all(meta$.D %in% c(0L, 1L, NA_integer_))) {
+    stop("Treatment column must be coded as 0/1.", call. = FALSE)
+  }
+
+  if (!is.null(cell_types)) {
+    keep <- meta$.CellType %in% cell_types
+    counts <- counts[, keep, drop = FALSE]
+    meta <- meta[keep, , drop = FALSE]
+  }
+
+  keep_gene <- .dedml_matrix_row_sums(counts) > 0
+  counts <- counts[keep_gene, , drop = FALSE]
+
+  meta$lib_size_filtered <- .dedml_matrix_col_sums(counts)
+  meta$nCount_RNA <- meta$lib_size_filtered
+  meta$nFeature_RNA <- .dedml_matrix_col_sums(counts > 0)
+  if (!"percent.mt" %in% colnames(meta)) {
+    mito <- grepl("^MT-", rownames(counts))
+    meta$percent.mt <- if (any(mito)) {
+      100 * .dedml_matrix_col_sums(counts[mito, , drop = FALSE]) / pmax(meta$nCount_RNA, 1)
+    } else {
+      NA_real_
+    }
+  }
+
+  generated <- c("log_lib_size", "log_n_cells", "nFeature_RNA", "percent.mt")
+  copy_cols <- setdiff(unique(c(treatment_confounders, outcome_confounders)), generated)
+  missing_cols <- setdiff(copy_cols, colnames(meta))
+  if (length(missing_cols)) {
+    stop("Missing confounder columns in meta: ", paste(missing_cols, collapse = ", "), call. = FALSE)
+  }
+
+  required <- unique(c(".dedml_cell_id", ".donor_id", ".sample_id", ".D", ".CellType", copy_cols, "nFeature_RNA", "percent.mt"))
+  keep <- stats::complete.cases(meta[, required, drop = FALSE])
+  meta <- meta[keep, , drop = FALSE]
+  counts <- counts[, meta$.dedml_cell_id, drop = FALSE]
+  if (nrow(meta) == 0L) stop("No metadata rows available after complete-case selection.", call. = FALSE)
+
+  donor_check <- tapply(meta$.D, meta$.donor_id, function(x) length(unique(x)))
+  if (any(donor_check != 1L)) {
+    bad <- names(donor_check)[donor_check != 1L]
+    stop("Treatment must be constant within donor. Violations: ", paste(utils::head(bad, 10), collapse = ", "), call. = FALSE)
+  }
+
+  meta_dt <- data.table::as.data.table(meta)
+  meta_dt[, unit_id := paste(.sample_id, .CellType, sep = "__")]
+  unit_levels <- unique(meta_dt$unit_id)
+  design <- Matrix::sparseMatrix(
+    i = seq_len(nrow(meta_dt)),
+    j = match(meta_dt$unit_id, unit_levels),
+    x = 1,
+    dims = c(nrow(meta_dt), length(unit_levels)),
+    dimnames = list(meta_dt$.dedml_cell_id, unit_levels)
+  )
+  pb_counts <- counts %*% design
+  colnames(pb_counts) <- unit_levels
+
+  base_cols <- c(".donor_id", ".sample_id", ".D", ".CellType")
+  unit_meta <- meta_dt[, c(
+    list(
+      n_cells = .N,
+      mean_cell_percent.mt = mean(as.numeric(percent.mt), na.rm = TRUE)
+    ),
+    lapply(.SD, function(x) x[1])
+  ), by = unit_id, .SDcols = unique(c(base_cols, copy_cols))]
+  unit_meta <- unit_meta[match(colnames(pb_counts), unit_id)]
+
+  pb_total <- .dedml_matrix_col_sums(pb_counts)
+  pb_features <- .dedml_matrix_col_sums(pb_counts > 0)
+  mito <- grepl("^MT-", rownames(pb_counts))
+  pb_mito <- if (any(mito)) .dedml_matrix_col_sums(pb_counts[mito, , drop = FALSE]) else rep(NA_real_, ncol(pb_counts))
+
+  unit_meta[, `:=`(
+    HATIMID = .donor_id,
+    sample_id = .sample_id,
+    D = .D,
+    CellType = .CellType,
+    lib_size_sum = pb_total,
+    log_lib_size = log(pmax(pb_total, 1)),
+    log_n_cells = log(pmax(n_cells, 1)),
+    nFeature_RNA = pb_features,
+    percent.mt = 100 * pb_mito / pmax(pb_total, 1),
+    .dedml_pb_offset = log(pmax(pb_total, 1))
+  )]
+  unit_meta[!is.finite(percent.mt), percent.mt := mean_cell_percent.mt]
+
+  celltypes <- sort(unique(unit_meta$CellType))
+  alpha_cols <- paste0(".dedml_alpha_group_", make.names(celltypes, unique = TRUE))
+  for (i in seq_along(celltypes)) {
+    unit_meta[[alpha_cols[[i]]]] <- as.integer(unit_meta$CellType == celltypes[[i]])
+  }
+
+  list(
+    counts = pb_counts[, unit_meta$unit_id, drop = FALSE],
+    meta = as.data.frame(unit_meta),
+    celltypes = celltypes,
+    alpha_cols = alpha_cols
+  )
+}
+
+.dedml_structured_pb_confounders <- function(pb, treatment_confounders, treatment_cell_summaries, outcome_confounders) {
+  list(
+    treatment_confounders = treatment_confounders,
+    treatment_cell_summaries = treatment_cell_summaries,
+    outcome_confounders = c(outcome_confounders, ".dedml_pb_offset", pb$alpha_cols)
+  )
+}
+
+.dedml_structured_pb_tuning_grid <- function(families) {
+  data.table::data.table(
+    family = rep(families, each = 3L),
+    outcome_structure = "structured",
+    variant = rep(c(
+      "fold5_n150_lr003_leaves7_min5",
+      "fold5_n200_lr003_leaves15_min10",
+      "fold5_n300_lr002_leaves31_min20"
+    ), times = length(families)),
+    n_folds = 5L,
+    nrounds = rep(c(150L, 200L, 300L), times = length(families)),
+    learning_rate = rep(c(0.03, 0.03, 0.02), times = length(families)),
+    num_leaves = rep(c(7L, 15L, 31L), times = length(families)),
+    min_data_in_leaf = rep(c(5L, 10L, 20L), times = length(families)),
+    feature_fraction = 1,
+    bagging_fraction = 1,
+    bagging_freq = 0L,
+    treatment_variant = "glm",
+    seed = rep(c(202605041L, 202605043L, 202605046L), times = length(families))
+  )
+}
+
+.dedml_choose_tuning_genes <- function(pb_counts, n_genes) {
+  if (toupper(n_genes) == "ALL") return(NULL)
+  n <- suppressWarnings(as.integer(n_genes))
+  if (!is.finite(n) || n < 10L) stop("tuning_n_genes must be ALL or an integer >= 10.", call. = FALSE)
+  gene_mean <- .dedml_matrix_row_sums(pb_counts) / ncol(pb_counts)
+  gene_nnz <- .dedml_matrix_row_sums(pb_counts > 0)
+  dt <- data.table::data.table(gene = rownames(pb_counts), score = log1p(gene_mean) * log1p(gene_nnz))
+  data.table::setorder(dt, -score, gene)
+  utils::head(dt$gene, n)
+}
+
+.dedml_run_structured_pb_variant <- function(pb, confounders, row, outdir, gene_subset, n_cores, parallel_backend, min_samples_per_celltype, pvalue_calibration, prefix, save_fit, verbose) {
+  run_label <- paste(row$family, row$outcome_structure, row$variant, row$treatment_variant, sep = "__")
+  run_dir <- if (is.null(outdir)) NULL else file.path(outdir, run_label)
+  if (!is.null(run_dir)) dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+
+  outcome_params <- list(
+    nrounds = as.integer(row$nrounds),
+    learning_rate = as.numeric(row$learning_rate),
+    num_leaves = as.integer(row$num_leaves),
+    min_data_in_leaf = as.integer(row$min_data_in_leaf),
+    feature_fraction = as.numeric(row$feature_fraction),
+    bagging_fraction = as.numeric(row$bagging_fraction),
+    bagging_freq = as.integer(row$bagging_freq),
+    num_threads = 1L,
+    deterministic = TRUE,
+    force_col_wise = TRUE,
+    verbosity = -1L,
+    .gc_after_fit = TRUE
+  )
+
+  if (isTRUE(verbose)) message("Running ", run_label)
+  start <- Sys.time()
+  fit <- dedml_fit(
+    counts = pb$counts,
+    meta = pb$meta,
+    donor_id = "HATIMID",
+    sample_id = "sample_id",
+    treatment = "D",
+    cell_type = "CellType",
+    confounder_spec = confounders,
+    cell_types = pb$celltypes,
+    gene_subset = gene_subset,
+    n_folds = as.integer(row$n_folds),
+    n_cores = n_cores,
+    donor_model = "glm",
+    treatment_params = list(),
+    outcome_model = "pseudobulk",
+    outcome_learner = "lightgbm",
+    outcome_distribution = row$family,
+    outcome_params = outcome_params,
+    min_cells_per_sample_ct = 1L,
+    min_samples_per_celltype = min_samples_per_celltype,
+    nb_size_min = 0.1,
+    nb_size_max = 1e6,
+    pvalue_calibration = pvalue_calibration,
+    calibration_quantile = 0.9,
+    parallel_backend = parallel_backend,
+    gene_chunk_size = 100L,
+    seed = as.integer(row$seed),
+    verbose = verbose
+  )
+
+  results <- data.table::as.data.table(fit$results)
+  if (!is.null(run_dir)) {
+    data.table::fwrite(results, file.path(run_dir, paste0(prefix, "_", run_label, "_results.csv")))
+    data.table::fwrite(data.table::as.data.table(fit$gene_results), file.path(run_dir, paste0(prefix, "_", run_label, "_gene_results.csv")))
+    data.table::fwrite(data.table::as.data.table(fit$diagnostics), file.path(run_dir, paste0(prefix, "_", run_label, "_diagnostics.csv")))
+    if (isTRUE(save_fit)) saveRDS(fit, file.path(run_dir, paste0(prefix, "_", run_label, "_fit.rds")))
+  }
+
+  metric <- results[, .(
+    n_tests = .N,
+    n_genes = data.table::uniqueN(gene),
+    n_celltypes = data.table::uniqueN(CellType),
+    n_fdr005 = sum(p_adj < 0.05, na.rm = TRUE),
+    median_abs_estimate = stats::median(abs(estimate), na.rm = TRUE),
+    median_abs_estimate_logfc = stats::median(abs(estimate_logfc), na.rm = TRUE),
+    min_p_value = min(p_value, na.rm = TRUE)
+  )]
+  metric[, `:=`(
+    family = row$family,
+    outcome_structure = row$outcome_structure,
+    variant = row$variant,
+    treatment_variant = row$treatment_variant,
+    nrounds = row$nrounds,
+    learning_rate = row$learning_rate,
+    num_leaves = row$num_leaves,
+    min_data_in_leaf = row$min_data_in_leaf,
+    elapsed_sec = as.numeric(difftime(Sys.time(), start, units = "secs")),
+    n_gene_errors = if (is.data.frame(fit$errors)) nrow(fit$errors) else 0L,
+    output_dir = if (is.null(run_dir)) NA_character_ else run_dir
+  )]
+  metric
+}
+
+.dedml_select_structured_pb_grid <- function(metrics, tuning_grid) {
+  metrics <- data.table::copy(data.table::as.data.table(metrics))
+  metrics[, n_gene_errors := data.table::fifelse(is.na(n_gene_errors), 0L, as.integer(n_gene_errors))]
+  metrics[, n_tests := data.table::fifelse(is.na(n_tests), 0L, as.integer(n_tests))]
+  metrics[, finite_metric_ok := is.finite(median_abs_estimate_logfc) | is.finite(median_abs_estimate)]
+  metrics[, tuning_score := 1000000 * n_gene_errors + 1000 * (n_tests <= 0L) + 100 * (!finite_metric_ok) + elapsed_sec / 3600]
+  selected_metrics <- metrics[order(tuning_score, elapsed_sec), .SD[1L], by = .(family, outcome_structure)]
+  selected_metrics[, selected_rule := paste(
+    "Rank within family + outcome_structure by penalizing gene errors, empty tests,",
+    "non-finite effect summaries, then runtime."
+  )]
+  merge(
+    tuning_grid,
+    selected_metrics[, .(
+      family, outcome_structure, variant, treatment_variant,
+      tuning_score, tuning_elapsed_sec = elapsed_sec,
+      tuning_n_gene_errors = n_gene_errors,
+      tuning_n_tests = n_tests,
+      selected_rule
+    )],
+    by = c("family", "outcome_structure", "variant", "treatment_variant"),
+    all.y = TRUE,
+    sort = FALSE
+  )
+}
+
+#' Run Structured Sum-Pseudobulk DEDML
+#'
+#' Runs the structured sum-pseudobulk DEDML pipeline used for the COVID real-data analyses.
+#'
+#' @param counts Gene-by-cell count matrix.
+#' @param meta Cell metadata data.frame.
+#' @param donor_id Donor id column name or vector.
+#' @param sample_id Sample id column name or vector.
+#' @param treatment Binary treatment column name or vector.
+#' @param cell_type Cell type column name or vector.
+#' @param cell_types Optional cell types to keep.
+#' @param families Outcome families to run, usually `c("nb", "poisson")`.
+#' @param treatment_confounders Donor-level treatment confounders.
+#' @param treatment_cell_summaries Pseudobulk summaries for the treatment model.
+#' @param outcome_confounders Outcome covariates before offset/alpha terms.
+#' @param outdir Optional output directory.
+#' @param prefix Output file prefix.
+#' @param tuning_n_genes `ALL` or number of genes for tuning.
+#' @param tune_only Run tuning only.
+#' @param tune_then_run Run selected full model after tuning.
+#' @param run_full_without_tuning Run the smallest grid directly.
+#' @param n_cores Number of gene-parallel workers.
+#' @param parallel_backend `"auto"`, `"fork"`, or `"psock"`.
+#' @param min_samples_per_celltype Minimum pseudobulk samples per cell type.
+#' @param pvalue_calibration P-value calibration mode.
+#' @param save_fit Save fit RDS files.
+#' @param verbose Print progress.
+#'
+#' @return A list with pseudobulk metadata, design report, tuning grid, selected grid, and metrics.
+#' @export
+#'
+dedml_run_structured_pseudobulk_pipeline <- function(
+    counts,
+    meta,
+    donor_id = "HATIMID",
+    sample_id = "sample_id",
+    treatment = "D",
+    cell_type = "CellType",
+    cell_types = NULL,
+    families = c("nb", "poisson"),
+    treatment_confounders = c("Age", "Sex"),
+    treatment_cell_summaries = c("log_lib_size", "log_n_cells", "nFeature_RNA", "percent.mt"),
+    outcome_confounders = c("Age", "Sex", "log_n_cells", "nFeature_RNA", "percent.mt"),
+    outdir = NULL,
+    prefix = "dedml_structured_sum_pseudobulk",
+    tuning_n_genes = "ALL",
+    tune_only = FALSE,
+    tune_then_run = TRUE,
+    run_full_without_tuning = FALSE,
+    n_cores = 1L,
+    parallel_backend = c("auto", "fork", "psock"),
+    min_samples_per_celltype = 5L,
+    pvalue_calibration = c("none", "tail"),
+    save_fit = TRUE,
+    verbose = TRUE) {
+  families <- match.arg(families, c("nb", "poisson", "gaussian"), several.ok = TRUE)
+  parallel_backend <- match.arg(parallel_backend)
+  pvalue_calibration <- match.arg(pvalue_calibration)
+  n_cores <- as.integer(n_cores)
+  if (is.na(n_cores) || n_cores < 1L) stop("n_cores must be a positive integer.", call. = FALSE)
+  if (!is.null(outdir)) dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  pb <- .dedml_make_sum_pseudobulk(
+    counts = counts,
+    meta = meta,
+    donor_id = donor_id,
+    sample_id = sample_id,
+    treatment = treatment,
+    cell_type = cell_type,
+    cell_types = cell_types,
+    treatment_confounders = treatment_confounders,
+    outcome_confounders = outcome_confounders
+  )
+  confounders <- .dedml_structured_pb_confounders(
+    pb = pb,
+    treatment_confounders = treatment_confounders,
+    treatment_cell_summaries = treatment_cell_summaries,
+    outcome_confounders = outcome_confounders
+  )
+
+  if (!is.null(outdir)) {
+    data.table::fwrite(data.table::as.data.table(pb$meta), file.path(outdir, paste0(prefix, "_pseudobulk_meta.csv")))
+    data.table::fwrite(data.table::as.data.table(pb$meta)[, .(
+      n_units = .N,
+      n_cells = sum(n_cells),
+      n_treated_units = sum(D == 1L),
+      n_control_units = sum(D == 0L),
+      n_treated_donors = data.table::uniqueN(HATIMID[D == 1L]),
+      n_control_donors = data.table::uniqueN(HATIMID[D == 0L])
+    ), by = CellType], file.path(outdir, paste0(prefix, "_celltype_summary.csv")))
+    saveRDS(confounders, file.path(outdir, paste0(prefix, "_confounder_spec.rds")))
+  }
+
+  design <- dedml_summarize_design(
+    meta = pb$meta,
+    donor_id = "HATIMID",
+    sample_id = "sample_id",
+    treatment = "D",
+    cell_type = "CellType",
+    confounder_spec = confounders,
+    cell_types = pb$celltypes,
+    n_folds = 5L,
+    donor_model = "glm",
+    treatment_params = list(),
+    seed = 202605041L,
+    stop_on_error = FALSE
+  )
+  if (!is.null(outdir)) {
+    data.table::fwrite(data.table::as.data.table(design$summary), file.path(outdir, paste0(prefix, "_design_summary.csv")))
+    data.table::fwrite(data.table::as.data.table(design$diagnostics), file.path(outdir, paste0(prefix, "_design_diagnostics.csv")))
+  }
+  if (nrow(design$diagnostics) && any(design$diagnostics$severity == "error")) {
+    stop("Fatal DEDML design diagnostics detected.", call. = FALSE)
+  }
+
+  tuning_grid <- .dedml_structured_pb_tuning_grid(families)
+  tuning_grid[, run_label := paste(family, outcome_structure, variant, treatment_variant, sep = "__")]
+  if (!is.null(outdir)) {
+    data.table::fwrite(tuning_grid, file.path(outdir, paste0(prefix, "_tuning_grid.csv")))
+  }
+
+  tuning_metrics <- NULL
+  if (isTRUE(run_full_without_tuning)) {
+    selected_grid <- tuning_grid[variant == "fold5_n150_lr003_leaves7_min5"]
+  } else {
+    tuning_dir <- if (is.null(outdir)) NULL else file.path(outdir, "tuning")
+    if (!is.null(tuning_dir)) dir.create(tuning_dir, recursive = TRUE, showWarnings = FALSE)
+    tuning_genes <- .dedml_choose_tuning_genes(pb$counts, tuning_n_genes)
+    if (!is.null(tuning_dir)) {
+      data.table::fwrite(data.table::data.table(gene = if (is.null(tuning_genes)) rownames(pb$counts) else tuning_genes), file.path(tuning_dir, paste0(prefix, "_tuning_genes.csv")))
+    }
+    tuning_metrics <- vector("list", nrow(tuning_grid))
+    for (i in seq_len(nrow(tuning_grid))) {
+      tuning_metrics[[i]] <- .dedml_run_structured_pb_variant(
+        pb = pb,
+        confounders = confounders,
+        row = as.list(tuning_grid[i]),
+        outdir = tuning_dir,
+        gene_subset = tuning_genes,
+        n_cores = n_cores,
+        parallel_backend = parallel_backend,
+        min_samples_per_celltype = min_samples_per_celltype,
+        pvalue_calibration = pvalue_calibration,
+        prefix = prefix,
+        save_fit = save_fit,
+        verbose = verbose
+      )
+    }
+    tuning_metrics <- data.table::rbindlist(tuning_metrics, fill = TRUE)
+    if (!is.null(tuning_dir)) {
+      data.table::fwrite(tuning_metrics, file.path(tuning_dir, paste0(prefix, "_tuning_metrics.csv")))
+    }
+    selected_grid <- .dedml_select_structured_pb_grid(tuning_metrics, tuning_grid)
+  }
+  if (!is.null(outdir)) {
+    data.table::fwrite(selected_grid, file.path(outdir, paste0(prefix, "_selected_grid.csv")))
+  }
+
+  full_metrics <- NULL
+  if (!isTRUE(tune_only)) {
+    if (isTRUE(tune_then_run) || isTRUE(run_full_without_tuning)) {
+      full_dir <- if (is.null(outdir)) NULL else file.path(outdir, "selected_full_run")
+      if (!is.null(full_dir)) dir.create(full_dir, recursive = TRUE, showWarnings = FALSE)
+      full_metrics <- vector("list", nrow(selected_grid))
+      for (i in seq_len(nrow(selected_grid))) {
+        full_metrics[[i]] <- .dedml_run_structured_pb_variant(
+          pb = pb,
+          confounders = confounders,
+          row = as.list(selected_grid[i]),
+          outdir = full_dir,
+          gene_subset = NULL,
+          n_cores = n_cores,
+          parallel_backend = parallel_backend,
+          min_samples_per_celltype = min_samples_per_celltype,
+          pvalue_calibration = pvalue_calibration,
+          prefix = prefix,
+          save_fit = save_fit,
+          verbose = verbose
+        )
+      }
+      full_metrics <- data.table::rbindlist(full_metrics, fill = TRUE)
+      if (!is.null(full_dir)) {
+        data.table::fwrite(full_metrics, file.path(full_dir, paste0(prefix, "_full_run_metrics.csv")))
+      }
+    }
+  }
+
+  list(
+    pseudobulk_meta = pb$meta,
+    celltypes = pb$celltypes,
+    confounder_spec = confounders,
+    design = design,
+    tuning_grid = tuning_grid,
+    tuning_metrics = tuning_metrics,
+    selected_grid = selected_grid,
+    full_metrics = full_metrics,
+    outdir = outdir
+  )
 }
 
 .build_design_matrix <- function(df, cols) {
@@ -1117,13 +1630,13 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
 
     z <- eta + (y - mu) / mu
     w <- sqrt(mu)
-    fit <- .Call(stats:::C_Cdqrls, x * w, z * w, tol, FALSE)
-    if (any(!is.finite(fit$coefficients))) {
+    fit <- stats::lm.fit(x * w, z * w, tol = tol)
+    if (any(!is.finite(fit$coefficients[!is.na(fit$coefficients)]))) {
       stop("non-finite Poisson IRLS coefficients", call. = FALSE)
     }
 
-    start <- numeric(p)
-    start[fit$pivot] <- fit$coefficients
+    start <- fit$coefficients
+    start[is.na(start)] <- 0
     eta_new <- as.numeric(x %*% start)
     mu_new <- exp(eta_new)
     dev <- sum(dev_resids(y, mu_new, rep.int(1, n)))
@@ -1146,7 +1659,7 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
     }
 
     rank <- fit$rank
-    pivot <- fit$pivot
+    pivot <- fit$qr$pivot
     coef <- start
     eta <- eta_new
     mu <- mu_new
@@ -1327,6 +1840,153 @@ make_stratified_donor_folds <- function(donor_id, treatment, n_folds = 3L, seed 
   if (isTRUE(gc_after_fit)) {
     gc(FALSE)
   }
+  pred
+}
+
+.fit_predict_lightgbm_structured_pb <- function(x_train, y_train, x_test, objective, params = list(), weight_train = NULL) {
+  offset_col <- ".dedml_pb_offset"
+  if (!(offset_col %in% colnames(x_train))) {
+    stop("Structured pseudobulk LightGBM requires .dedml_pb_offset.", call. = FALSE)
+  }
+
+  eps <- 1e-8
+  y_train <- as.numeric(y_train)
+  w_train <- if (is.null(weight_train)) rep(1, length(y_train)) else as.numeric(weight_train)
+  w_train[!is.finite(w_train) | w_train <= 0] <- 1
+
+  base_offset_train <- as.numeric(x_train[, offset_col])
+  base_offset_test <- as.numeric(x_test[, offset_col])
+  group_cols <- grep("^\\.dedml_alpha_group_", colnames(x_train), value = TRUE)
+
+  group_from_matrix <- function(x, cols) {
+    if (length(cols) == 0L) return(rep(NA_character_, nrow(x)))
+    mat <- as.matrix(x[, cols, drop = FALSE])
+    idx <- max.col(mat, ties.method = "first")
+    empty <- rowSums(mat, na.rm = TRUE) <= 0
+    out <- cols[idx]
+    out[empty] <- NA_character_
+    out
+  }
+
+  poisson_alpha_mle <- function(y, eta_base, w) {
+    log((sum(w * y, na.rm = TRUE) + eps) / (sum(w * exp(eta_base), na.rm = TRUE) + eps))
+  }
+
+  nb_alpha_mle <- function(y, eta_base, w, size) {
+    size <- suppressWarnings(as.numeric(size))[1]
+    if (!is.finite(size) || size <= 0) return(poisson_alpha_mle(y, eta_base, w))
+    if (sum(w * y, na.rm = TRUE) <= 0) {
+      return(log(eps / (sum(w * exp(eta_base), na.rm = TRUE) + eps)))
+    }
+    score <- function(alpha) {
+      mu <- pmax(exp(eta_base + alpha), 1e-12)
+      sum(w * size * (y - mu) / (size + mu), na.rm = TRUE)
+    }
+    lower <- -40
+    upper <- 40
+    s_lower <- score(lower)
+    s_upper <- score(upper)
+    if (!is.finite(s_lower) || !is.finite(s_upper)) return(poisson_alpha_mle(y, eta_base, w))
+    if (s_lower <= 0) return(lower)
+    if (s_upper >= 0) return(upper)
+    stats::uniroot(score, lower = lower, upper = upper, tol = 1e-8)$root
+  }
+
+  predict_lgb_raw <- function(fit, x) {
+    pred <- tryCatch(
+      stats::predict(fit, x, type = "raw"),
+      error = function(e) {
+        msg <- conditionMessage(e)
+        if (grepl("unused argument|type", msg, ignore.case = TRUE)) {
+          return(stats::predict(fit, x, rawscore = TRUE))
+        }
+        stop(e)
+      }
+    )
+    as.numeric(pred)
+  }
+
+  group_train <- group_from_matrix(x_train, group_cols)
+  group_test <- group_from_matrix(x_test, group_cols)
+  alpha_init <- stats::setNames(numeric(length(group_cols)), group_cols)
+  for (ct in group_cols) {
+    idx <- group_train == ct
+    alpha_init[ct] <- poisson_alpha_mle(y_train[idx], base_offset_train[idx], w_train[idx])
+  }
+
+  alpha_train <- alpha_init[group_train]
+  alpha_train[!is.finite(alpha_train)] <- 0
+  joint_offset_train <- base_offset_train + alpha_train
+
+  remove_cols <- unique(c(
+    offset_col,
+    group_cols,
+    grep("CellType|celltype|cell_type", colnames(x_train), value = TRUE, ignore.case = TRUE)
+  ))
+  x_train_fit <- x_train[, setdiff(colnames(x_train), remove_cols), drop = FALSE]
+  x_test_fit <- x_test[, setdiff(colnames(x_test), remove_cols), drop = FALSE]
+
+  if (sum(w_train * y_train, na.rm = TRUE) <= 0) {
+    pred <- rep(1e-6, nrow(x_test_fit))
+    attr(pred, "nb_size") <- 1e6
+    attr(pred, "lgb_nb_size") <- 1e6
+    return(pred)
+  }
+
+  default_params <- list(
+    objective = objective,
+    learning_rate = 0.05,
+    num_leaves = 31,
+    min_data_in_leaf = 50,
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    bagging_freq = 1,
+    verbosity = -1,
+    num_threads = 1
+  )
+  params$.lgb_dataset <- NULL
+  gc_after_fit <- isTRUE(params$.gc_after_fit)
+  params$.gc_after_fit <- NULL
+  params$.reuse_lgb_dataset <- NULL
+  merged_params <- utils::modifyList(default_params, params)
+  if (is.null(merged_params$metric)) merged_params$metric <- objective
+  nrounds <- if (!is.null(merged_params$nrounds)) as.integer(merged_params$nrounds) else 150L
+  merged_params$nrounds <- NULL
+
+  dtrain <- lightgbm::lgb.Dataset(data = x_train_fit, label = y_train, weight = w_train)
+  dtrain$set_field("init_score", joint_offset_train)
+  fit <- lightgbm::lgb.train(params = merged_params, data = dtrain, nrounds = nrounds, verbose = -1)
+
+  raw_train <- predict_lgb_raw(fit, x_train_fit)
+  raw_test <- predict_lgb_raw(fit, x_test_fit)
+
+  nb_size <- NA_real_
+  if (objective %in% c("negative_binomial_free", "nb_free", "negativebinomial_free") &&
+      "get_negative_binomial_size" %in% names(fit)) {
+    nb_size <- tryCatch(as.numeric(fit$get_negative_binomial_size()), error = function(e) NA_real_)
+  }
+
+  alpha_final <- alpha_init
+  for (ct in group_cols) {
+    idx <- group_train == ct
+    eta_base_train <- base_offset_train + raw_train
+    alpha_final[ct] <- if (objective %in% c("negative_binomial_free", "nb_free", "negativebinomial_free")) {
+      nb_alpha_mle(y_train[idx], eta_base_train[idx], w_train[idx], nb_size)
+    } else {
+      poisson_alpha_mle(y_train[idx], eta_base_train[idx], w_train[idx])
+    }
+  }
+
+  alpha_test <- alpha_final[group_test]
+  alpha_test[!is.finite(alpha_test)] <- 0
+  pred <- pmax(exp(base_offset_test + alpha_test + raw_test), 1e-6)
+  attr(pred, "nb_size") <- nb_size
+  attr(pred, "lgb_nb_size") <- nb_size
+
+  try(fit$.__enclos_env__$private$finalize(), silent = TRUE)
+  try(dtrain$.__enclos_env__$private$finalize(), silent = TRUE)
+  rm(fit, dtrain)
+  if (isTRUE(gc_after_fit)) gc(FALSE)
   pred
 }
 
@@ -2247,6 +2907,16 @@ fit_residual_regression_pseudobulk_matrix <- function(
       poisson = "poisson",
       nb = "negative_binomial_free"
     )
+    if (".dedml_pb_offset" %in% colnames(x_train)) {
+      return(.fit_predict_lightgbm_structured_pb(
+        x_train = x_train,
+        y_train = y_train,
+        x_test = x_test,
+        objective = objective,
+        params = params,
+        weight_train = weights_train
+      ))
+    }
     return(.fit_predict_lightgbm(
       x_train = x_train,
       y_train = y_train,
@@ -3186,6 +3856,10 @@ dedml_fit <- function(
     pb_df <- pb_data$pb_df
     y_pb_mat <- pb_data$y_pb_mat
     x_pb <- pb_data$x_pb
+    pb_min_samples_per_celltype <- as.integer(min_samples_per_celltype)[1L]
+    if (!is.finite(pb_min_samples_per_celltype) || pb_min_samples_per_celltype < 1L) {
+      pb_min_samples_per_celltype <- 3L
+    }
     pb_fold_plan <- lapply(seq_len(n_folds), function(k) {
       train_idx <- which(pb_df$fold != k)
       test_idx <- which(pb_df$fold == k)
@@ -3245,7 +3919,7 @@ dedml_fit <- function(
           y_resid_pb_mat = y_resid_pb_mat,
           pb_df = pb_df,
           gene_names = block_gene_names,
-          min_samples = min_samples_per_celltype,
+          min_samples = pb_min_samples_per_celltype,
           cluster_robust = TRUE
         )
         if (is.null(rr) || nrow(rr) == 0L) {
